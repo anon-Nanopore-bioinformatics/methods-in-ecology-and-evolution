@@ -1,0 +1,2875 @@
+---
+title: "MEE Sequence Analysis R code - cleaned & annotated"
+output: html_notebook
+---
+
+##### Sexing Data Analysis #####
+```{r}
+# ============================================================
+# Input:
+#   eDNA_tissue_sexing_data.csv
+# Output object:
+#   sexing  (cleaned column names + standardized eDNA column names)
+# ============================================================
+
+library(tidyverse)
+library(janitor)
+library(readr)
+
+sexing <- readr::read_csv(
+  "eDNA_tissue_sexing_data.csv",
+  show_col_types = FALSE
+) %>%
+  janitor::clean_names() %>%
+  rename(
+    edna_sample = e_dna_sample,
+    edna_sex    = e_dna_sex
+  )
+
+glimpse(sexing)
+```
+```{r}
+# ============================================================
+# SEXING SUCCESS MODEL
+# Logistic regression testing whether MarVer concentration
+#     predicts successful molecular sex identification from eDNA
+#
+# Input:
+#   sexing  (cleaned dataset from previous setup chunk)
+#
+# Steps:
+#   1. Keep rows corresponding to eDNA samples
+#   2. Define binary success variable (1 = sex assigned, 0 = no call)
+#   3. Fit binomial GLM: success ~ marver_conc
+# ============================================================
+
+sexing_edna <- sexing %>%
+  filter(!is.na(edna_sample)) %>%      # retain eDNA samples only
+  mutate(success = if_else(!is.na(edna_sex), 1, 0))
+
+model1 <- glm(
+  success ~ marver_conc,
+  data = sexing_edna,
+  family = binomial
+)
+
+summary(model1)
+```
+```{r}
+# ============================================================
+# FIGURE 3b
+# Logistic regression visualization:
+#     Probability of successful sex ID vs MarVer concentration
+#
+# Plot elements:
+#   points  : observed outcomes (0 = failure, 1 = success)
+#   curve   : binomial GLM fit (success ~ marver_conc)
+#   shading : 95% confidence interval
+# ============================================================
+
+library(ggplot2)
+
+p_sex_success <- ggplot(sexing_edna, aes(x = marver_conc, y = success)) +
+  geom_jitter(height = 0.05, width = 0) +
+  stat_smooth(
+    method = "glm",
+    method.args = list(family = "binomial"),
+    se = TRUE,
+    color = "orchid",
+    fill  = "grey80"
+  ) +
+  labs(
+    x = expression("Marine vertebrate DNA concentration (ng/" * mu * "L)"),
+    y = "Predicted probability of sexing success"
+  ) +
+  theme_bw()
+
+p_sex_success
+```
+```{r}
+# ============================================================
+# SUPPORTING FIGURE 3
+# Spatial distribution of sexed eDNA samples
+#
+# Points show sampling locations colored by whether a
+# sex ID was successfully recovered from the eDNA sample
+# Point size represents MarVer concentration
+#
+#
+# Variables used:
+#   lon, lat        : sampling coordinates
+#   success         : binary sexing outcome (0 = fail, 1 = success)
+#   marver_conc     : Marine vertebrate DNA concentration
+# ============================================================
+
+p_sexing_map <- ggplot(sexing_edna, aes(x = lon, y = lat)) +
+  geom_point(
+    aes(
+      color = factor(success),
+      size  = marver_conc
+    )
+  ) +
+  scale_color_manual(
+    values = c("grey60", "red3"),
+    labels = c("0" = "FALSE", "1" = "TRUE")
+  ) +
+  theme_bw() +
+  labs(
+    color = "eDNA sex recovered",
+    size  = "MarVer concentration (ng/µL)",
+    x = "Longitude",
+    y = "Latitude"
+  )
+
+p_sexing_map
+
+```
+
+```{r}
+# ============================================================
+# SEX ASSIGNMENT CONCORDANCE
+# Agreement between eDNA-derived sex ID and tissue-based sex
+#
+#
+# Steps:
+#   1. Keep samples where both tissue and eDNA sex were successfully called
+#   2. Count total comparable samples
+#   3. Count matches between tissue and eDNA sex
+#   4. Compute concordance proportion
+# ============================================================
+
+sexing_called <- sexing %>%
+  filter(!is.na(edna_sex),
+         !is.na(tissue_sex))
+
+n_called <- nrow(sexing_called)
+
+n_match <- sum(
+  tolower(sexing_called$edna_sex) ==
+  tolower(sexing_called$tissue_sex)
+)
+
+concordance <- n_match / n_called
+
+concordance
+```
+```{r}
+# ============================================================
+# SEX ASSIGNMENT STATISTICAL TEST
+# Binomial proportion test for concordance between eDNA and tissue sex IDs
+#
+# Input:
+#   n_match  : number of matching sex assignments
+#   n_called : total comparable samples
+#
+# Also prints the contingency table of eDNA vs tissue sex ID
+# ============================================================
+
+# Binomial test of concordance proportion
+prop.test(n_match, n_called)
+
+# Contingency table of eDNA vs tissue sex assignments
+table(
+  sexing_called$edna_sex,
+  sexing_called$tissue_sex
+)
+```
+
+```{r}
+# ============================================================
+# FIGURE 3a
+# Concordance between tissue-derived and eDNA-derived sex ID
+#
+# Each row represents a paired sample / Rows are ordered so that:
+#   1) matching female assignments appear first
+#   2) mismatches appear in the middle
+#   3) matching male assignments appear last
+# ============================================================
+
+sex_plot <- sexing %>%
+  filter(!is.na(edna_sex)) %>%
+  mutate(
+    eDNA   = tolower(edna_sex),
+    Tissue = tolower(tissue_sex),
+    match  = eDNA == Tissue,
+    order_group = case_when(
+      match & Tissue == "female" ~ 1,
+      !match                     ~ 2,
+      match & Tissue == "male"   ~ 3
+    )
+  ) %>%
+  arrange(order_group) %>%
+  mutate(sample_id = row_number()) %>%
+  select(sample_id, eDNA, Tissue) %>%
+  pivot_longer(
+    cols = c(eDNA, Tissue),
+    names_to = "sample_type",
+    values_to = "sex"
+  ) %>%
+  mutate(
+    sample_type = factor(sample_type, levels = c("eDNA", "Tissue")),
+    sample_id   = factor(sample_id, levels = rev(unique(sample_id)))
+  )
+
+p_sex_tiles <- ggplot(sex_plot, aes(x = sample_type, y = sample_id, fill = sex)) +
+  geom_tile(color = "black", linewidth = 0.25) +
+  scale_fill_manual(
+    values = c(
+      "female" = "#e78ac3",
+      "male"   = "#4ea3de"
+    ),
+    na.value = "white"
+  ) +
+  scale_x_discrete(labels = c("Tissue" = "tissue")) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 6)
+  ) +
+  labs(fill = "Sex")
+
+p_sex_tiles
+
+```
+
+##### Nanopore Data Analysis #####
+```{r}
+# ============================================================
+# Tier-3 SNP filtering (variant-only SNP tables) + REF fill
+# Profiles: strict / moderate / relaxed
+#
+# Inputs:
+#   - nanopore_barcode_metadata.csv
+#   - snp_tables_medaka_*_d10000/*_snps.tsv   (variant-only SNP tables per barcode)
+#
+# Outputs (objects):
+#   - profiles         : list of profile parameters
+#   - qc_current           : Tier-1 QC metadata (barcode + sample_type + mapped_primary_reads)
+#   - profile_results  : results per profile (snps, tier3 panel, hapmat, etc.)
+#   - summary_tbl      : per-profile summary (Tier-1 counts, Tier-2 union, Tier-3 panel size)
+#
+# Optional written outputs (if save_outputs=TRUE):
+#   - tier3_<profile>_panel.tsv
+#   - tier3_<profile>_hapmat.tsv
+# ============================================================
+
+library(tidyverse)
+library(purrr)
+library(dplyr)
+
+# ----------------------------
+# 1) Profile parameters
+# ----------------------------
+profiles <- list(
+  strict = list(
+    dir = "snp_tables_medaka_strict_d10000",
+    tier1_min_reads = 1000,
+    vaf_low = 0.70, frac_low_max = 0.60, maf_min = 0.25,
+    min_alt_hi = 2, alt_support_min = 2
+  ),
+  moderate = list(
+    dir = "snp_tables_medaka_moderate_d10000",
+    tier1_min_reads = 500,
+    vaf_low = 0.65, frac_low_max = 0.70, maf_min = 0.20,
+    min_alt_hi = 2, alt_support_min = 2
+  ),
+  relaxed = list(
+    dir = "snp_tables_medaka_relaxed_d10000",
+    tier1_min_reads = 250,
+    vaf_low = 0.60, frac_low_max = 0.80, maf_min = 0.15,
+    min_alt_hi = 2, alt_support_min = 2
+  )
+)
+
+# ----------------------------
+# 2) Tier-1 QC
+# ----------------------------
+qc_current <- readr::read_csv("nanopore_barcode_metadata.csv", show_col_types = FALSE) %>%
+  mutate(barcode = as.character(barcode))
+
+stopifnot(all(c("barcode", "sample_type", "mapped_primary_reads") %in% names(qc_current)))
+
+# ============================================================
+# Function: read_profile_snps()
+# Reads all *_snps.tsv files in a directory (variant-only tables)
+# Produces a long table with DP4 parsed into rf/rr/af/ar + alt_count + vaf
+# ============================================================
+read_profile_snps <- function(dir, keep_barcodes = NULL) {
+
+  files <- list.files(dir, pattern = "_snps\\.tsv$", full.names = TRUE)
+  if (length(files) == 0) stop("No *_snps.tsv files found in: ", dir)
+
+  read_one <- function(path) {
+
+    bc <- stringr::str_remove(basename(path), "_snps\\.tsv$")
+
+    # Optionally skip barcodes not in keep list
+    if (!is.null(keep_barcodes) && !(bc %in% keep_barcodes)) return(NULL)
+
+    x <- readr::read_tsv(
+      path,
+      col_names = FALSE,
+      col_types = cols(
+        X1 = col_character(),  # CHROM
+        X2 = col_double(),     # POS
+        X3 = col_character(),  # REF
+        X4 = col_character(),  # ALT
+        X5 = col_double(),     # QUAL
+        X6 = col_double(),     # DP
+        X7 = col_character()   # DP4
+      ),
+      show_col_types = FALSE,
+      progress = FALSE
+    )
+
+    names(x) <- c("CHROM","POS","REF","ALT","QUAL","DP","DP4")
+
+    x %>%
+      mutate(
+        barcode = bc,
+        DP4 = dplyr::coalesce(DP4, ""),
+        DP4 = stringr::str_trim(DP4),
+        DP4 = stringr::str_replace(DP4, ",+$", "")
+      )
+  }
+
+  snps <- purrr::map_dfr(files, read_one)
+
+  snps %>%
+    mutate(
+      dp4 = stringr::str_split(DP4, ",", simplify = TRUE),
+      rf = suppressWarnings(as.numeric(dp4[, 1])),
+      rr = suppressWarnings(as.numeric(dp4[, 2])),
+      af = suppressWarnings(as.numeric(dp4[, 3])),
+      ar = suppressWarnings(as.numeric(dp4[, 4])),
+      alt_count = dplyr::coalesce(af, 0) + dplyr::coalesce(ar, 0),
+      vaf = dplyr::if_else(!is.na(DP) & DP > 0, alt_count / DP, NA_real_)
+    ) %>%
+    select(barcode, CHROM, POS, REF, ALT, QUAL, DP, rf, rr, af, ar, alt_count, vaf)
+}
+
+# ============================================================
+# Function: tier3_define_panel_variant_only()
+# Defines the Tier-3 "panel" of positions using variant-only tables
+# ============================================================
+tier3_define_panel_variant_only <- function(snps,
+                                            barcodes_used,
+                                            vaf_low,
+                                            frac_low_max,
+                                            maf_min,
+                                            min_alt_hi,
+                                            alt_support_min) {
+
+  all_barcodes <- sort(unique(barcodes_used))
+
+  snps <- snps %>% filter(barcode %in% all_barcodes)
+
+  # "low_flag" for a barcode-position call:
+  # - missing vaf
+  # - below vaf threshold
+  # - alt count below min_alt_hi
+  snps2 <- snps %>%
+    mutate(low_flag = is.na(vaf) | (vaf < vaf_low) | (alt_count < min_alt_hi))
+
+  pos_low <- snps2 %>%
+    group_by(CHROM, POS) %>%
+    summarise(
+      n_var_rows = n_distinct(barcode),
+      n_low_var  = n_distinct(barcode[low_flag]),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      n_missing = length(all_barcodes) - n_var_rows,
+      frac_low  = (n_low_var + n_missing) / length(all_barcodes)
+    )
+
+  pos_low_keep <- pos_low %>% filter(frac_low <= frac_low_max)
+
+  # Alt-present indicator (only for non-low calls meeting vaf threshold)
+  alt_present <- snps2 %>%
+    filter(!low_flag, vaf >= vaf_low) %>%
+    distinct(CHROM, POS, barcode) %>%
+    mutate(alt_present = 1L)
+
+  # MAF table: expand all CHROM x POS combinations seen in snps2
+  maf_tbl_all <- tidyr::expand_grid(
+    CHROM = sort(unique(snps2$CHROM)),
+    POS   = sort(unique(snps2$POS)),
+    barcode = all_barcodes
+  ) %>%
+    left_join(alt_present, by = c("CHROM","POS","barcode")) %>%
+    mutate(alt_present = tidyr::replace_na(alt_present, 0L)) %>%
+    group_by(CHROM, POS) %>%
+    summarise(
+      p_alt = mean(alt_present),
+      maf   = pmin(p_alt, 1 - p_alt),
+      .groups = "drop"
+    )
+
+  maf_keep <- maf_tbl_all %>% filter(maf >= maf_min)
+
+  # How many barcodes support ALT at each position (after low filtering) ?? 
+  alt_support_all <- snps2 %>%
+    filter(!low_flag, vaf >= vaf_low) %>%
+    group_by(CHROM, POS) %>%
+    summarise(alt_support = n_distinct(barcode), .groups = "drop")
+
+  alt_keep <- alt_support_all %>% filter(alt_support >= alt_support_min)
+
+  # Final Tier-3 panel = intersection of (frac_low) ∩ (MAF) ∩ (ALT support)
+  panel <- pos_low_keep %>%
+    inner_join(maf_keep, by = c("CHROM","POS")) %>%
+    inner_join(alt_keep, by = c("CHROM","POS")) %>%
+    arrange(POS)
+
+  # Diagnostics table 
+  diag <- tibble(
+    step = c(
+      "positions_total",
+      paste0("frac_low <= ", frac_low_max),
+      paste0("MAF >= ", maf_min),
+      paste0("ALT_support >= ", alt_support_min),
+      "final_intersection"
+    ),
+    n_positions = c(
+      dplyr::n_distinct(snps2$POS),
+      nrow(pos_low_keep),
+      nrow(maf_keep),
+      nrow(alt_keep),
+      nrow(panel)
+    )
+  )
+
+  list(
+    panel = panel,
+    diag = diag,
+    pos_low_all = pos_low,
+    maf_tbl_all = maf_tbl_all,
+    alt_support_all = alt_support_all
+  )
+}
+
+# ============================================================
+# Function: make_hapmat_REFfill()
+# Creates a haplotype matrix across Tier-3 positions
+# Variant-only rows are used; missing positions are REF-filled using REF_base per position
+# ============================================================
+make_hapmat_REFfill <- function(snps, panel_tbl, barcodes_used, vaf_low, min_alt_hi) {
+
+  panel_pos <- panel_tbl %>%
+    transmute(CHROM, POS) %>%
+    distinct() %>%
+    arrange(POS)
+
+  stopifnot(nrow(panel_pos) > 0)
+
+  all_barcodes <- sort(unique(barcodes_used))
+
+  # Determine REF base at each panel position from SNP table
+  ref_by_pos <- snps %>%
+    semi_join(panel_pos, by = c("CHROM","POS")) %>%
+    group_by(CHROM, POS) %>%
+    summarise(REF_base = dplyr::first(REF), .groups = "drop")
+
+  # Calls at panel positions: ALT if not low and meets threshold, else REF
+  calls <- snps %>%
+    filter(barcode %in% all_barcodes) %>%
+    semi_join(panel_pos, by = c("CHROM","POS")) %>%
+    mutate(
+      low_flag = is.na(vaf) | (vaf < vaf_low) | (alt_count < min_alt_hi),
+      allele = dplyr::if_else(!low_flag & vaf >= vaf_low, ALT, REF)
+    ) %>%
+    select(barcode, CHROM, POS, allele)
+
+  # Full grid across all barcodes x all panel positions
+  grid <- tidyr::expand_grid(
+    barcode = all_barcodes,
+    panel_pos
+  )
+
+  # Merge calls into grid; fill missing allele with REF_base
+  hap_long <- grid %>%
+    left_join(calls, by = c("barcode","CHROM","POS")) %>%
+    left_join(ref_by_pos, by = c("CHROM","POS")) %>%
+    mutate(base = dplyr::if_else(!is.na(allele), allele, REF_base)) %>%
+    mutate(POS = as.character(POS)) %>%
+    select(barcode, POS, base)
+
+  # Wide matrix: one row per barcode, one column per POS
+  hap_long %>%
+    pivot_wider(names_from = POS, values_from = base) %>%
+    arrange(barcode)
+}
+
+# ============================================================
+# Function: run_profile()
+# Runs Tier-1 filtering + reads SNP tables + Tier-3 panel + hap matrix
+#     Optionally writes tier3_<profile>_panel.tsv + tier3_<profile>_hapmat.tsv
+# ============================================================
+run_profile <- function(p, name, qc_current,
+                        qc_reads_col = "mapped_primary_reads",
+                        save_outputs = TRUE) {
+  keep_barcodes <- qc_current %>%
+    filter(sample_type %in% c("tissue","eDNA")) %>%
+    filter(.data[[qc_reads_col]] >= p$tier1_min_reads) %>%
+    pull(barcode) %>%
+    unique()
+
+  if (length(keep_barcodes) == 0) {
+    stop(
+      "No barcodes passed Tier-1 for profile ", name,
+      " using ", qc_reads_col, " >= ", p$tier1_min_reads
+    )
+  }
+
+  # Read SNPs for these barcodes only
+  snps <- read_profile_snps(p$dir, keep_barcodes = keep_barcodes) %>%
+    left_join(qc_current %>% select(barcode, sample_type), by = "barcode")
+
+  # Tier-3 panel definition
+  t3 <- tier3_define_panel_variant_only(
+    snps,
+    barcodes_used   = keep_barcodes,
+    vaf_low         = p$vaf_low,
+    frac_low_max    = p$frac_low_max,
+    maf_min         = p$maf_min,
+    min_alt_hi      = p$min_alt_hi,
+    alt_support_min = p$alt_support_min
+  )
+
+  message("\nTier3 diagnostics for: ", name)
+  print(t3$diag)
+
+  if (nrow(t3$panel) == 0) {
+    stop(
+      "Tier-3 panel is empty for profile: ", name,
+      "\nTry lowering maf_min or vaf_low slightly for this profile."
+    )
+  }
+
+  # Haplotype matrix with REF fill
+  hapmat <- make_hapmat_REFfill(
+    snps, t3$panel,
+    barcodes_used = keep_barcodes,
+    vaf_low       = p$vaf_low,
+    min_alt_hi    = p$min_alt_hi
+  )
+
+  message(
+    "DONE: ", name,
+    " | barcodes=", length(keep_barcodes),
+    " | panel_n=", nrow(t3$panel),
+    " | hapmat=", nrow(hapmat), "x", (ncol(hapmat) - 1)
+  )
+
+  # Optional 
+  if (isTRUE(save_outputs)) {
+    out_prefix <- paste0("tier3_", name)
+    readr::write_tsv(t3$panel, paste0(out_prefix, "_panel.tsv"))
+    readr::write_tsv(hapmat,   paste0(out_prefix, "_hapmat.tsv"))
+  }
+
+  list(
+    name = name,
+    params = p,
+    barcodes_used = keep_barcodes,
+    snps = snps,
+    tier3 = t3,
+    panel_pos = t3$panel$POS,
+    hapmat = hapmat
+  )
+}
+
+# ----------------------------
+# 3) Run all profiles
+# ----------------------------
+profile_results <- purrr::imap(profiles, ~ run_profile(.x, .y, qc_current = qc_current))
+
+# ----------------------------
+# 4) Summary table (Tier-1 + Tier-2 union + Tier-3 final panel size)
+# ----------------------------
+summary_tbl <- purrr::imap_dfr(profile_results, function(res, nm) {
+  tibble(
+    profile = nm,
+    tier1_min_reads = res$params$tier1_min_reads,
+    n_barcodes = length(res$barcodes_used),
+    n_sites_tier2_union = dplyr::n_distinct(res$snps$POS),
+    n_sites_final = nrow(res$tier3$panel)
+  )
+})
+
+print(summary_tbl)
+```
+
+```{r}
+# ============================================================
+# TIER-3 DIAGNOSTICS SUMMARY (per profile)
+# Extracts position counts at each Tier-3 filtering step from res$tier3$diag
+#   plus the Tier-2 union of variant positions observed across barcodes
+#
+# Input:
+#   - profile_results
+#
+# Output object:
+#   - summary_tbl2    : per-profile diagnostics table
+# ============================================================
+
+summary_tbl2 <- purrr::imap_dfr(profile_results, function(res, nm) {
+
+  d <- res$tier3$diag
+
+  tibble::tibble(
+    profile = nm,
+    n_barcodes = length(res$barcodes_used),
+    tier2_union_pos = dplyr::n_distinct(res$snps$POS),
+    after_frac_low  = d$n_positions[stringr::str_detect(d$step, "^frac_low")][1],
+    after_maf       = d$n_positions[stringr::str_detect(d$step, "^MAF")][1],
+    after_alt_sup   = d$n_positions[stringr::str_detect(d$step, "^ALT_support")][1],
+    final_panel     = d$n_positions[d$step == "final_intersection"][1]
+  )
+
+})
+
+print(summary_tbl2)
+```
+
+```{r}
+# ============================================================
+# PANEL RECOVERY SUMMARY (callable sites per barcode)
+# Descriptive QC summarizing how many Tier-3 panel positions are callable
+# per barcode, then averaging by sample_type
+#
+# Inputs:
+#   - profile_results : list with $hapmat and $panel_pos per profile (from Tier-3 step)
+#   - qc_current         : barcode metadata with sample_type
+#
+# Output object:
+#   - panel_recovery_summary : per-profile x sample_type summary table
+#
+# Notes:
+#   - Uses REF-filled hapmat / callable here is "not NA" in hapmat
+#   - This is descriptive QC only / does not alter downstream inference
+# ============================================================
+
+panel_recovery_summary <- purrr::imap_dfr(profile_results, function(res, profile_name) {
+
+  hapmat  <- res$hapmat
+  panel_n <- length(res$panel_pos)
+
+  hapmat2 <- hapmat %>%
+    left_join(qc_sub %>% select(barcode, sample_type), by = "barcode")
+
+  # Count callable SNPs per barcode across Tier-3 panel
+  per_barcode <- hapmat2 %>%
+    pivot_longer(
+      cols = -c(barcode, sample_type),
+      names_to = "POS",
+      values_to = "base"
+    ) %>%
+    group_by(barcode, sample_type) %>%
+    summarise(
+      n_callable = sum(!is.na(base)),
+      .groups = "drop"
+    ) %>%
+    mutate(frac_callable = n_callable / panel_n)
+
+  # Summarize callable recovery by sample_type
+  per_barcode %>%
+    group_by(sample_type) %>%
+    summarise(
+      profile            = profile_name,
+      tier1_min_reads    = res$params$tier1_min_reads,
+      panel_size         = panel_n,
+      n_barcodes         = n(),
+      mean_callable      = mean(n_callable),
+      mean_frac_callable = mean(frac_callable),
+      .groups = "drop"
+    )
+
+})
+
+panel_recovery_summary
+
+```
+
+
+```{r}
+# ============================================================
+# DEPTH TABLES
+# Build depth_long from per-barcode depth files
+#
+# Inputs:
+#   - depth/ directory with *_clean.depth files (CHROM, POS, DP)
+#   - qc_current: data frame with barcode-level metadata:
+#       barcode, profile, sample_type, num_fragments
+#
+# Output object:
+#   - depth_long : long table with columns
+#       barcode, CHROM, POS, DP, profile, sample_type, num_fragments
+#
+# Notes:
+#   - qc_current is collapsed to one row per barcode
+# ============================================================
+
+library(tidyverse)
+
+# ----------------------------
+# 1) Read per-barcode depth files
+# ----------------------------
+depth_dir <- "depth"
+depth_files <- list.files(depth_dir, pattern = "_clean\\.depth$", full.names = TRUE)
+
+depth_long0 <- purrr::map_dfr(depth_files, \(f) {
+
+  bc <- stringr::str_remove(basename(f), "_clean\\.depth$")
+
+  readr::read_tsv(
+    f,
+    col_names = c("CHROM","POS","DP"),
+    col_types = cols(
+      CHROM = col_character(),
+      POS   = col_double(),
+      DP    = col_double()
+    ),
+    progress = FALSE,
+    show_col_types = FALSE
+  ) %>%
+    mutate(barcode = bc)
+
+})
+
+# ----------------------------
+# 2) One-row-per-barcode metadata (from qc_current)
+# ----------------------------
+names(qc_current)
+meta_bp_1 <- qc_current %>%
+  mutate(barcode = as.character(barcode)) %>%
+  group_by(barcode) %>%
+  summarise(
+    profile       = dplyr::first(na.omit(profile)),
+    sample_type   = dplyr::first(na.omit(sample_type)),
+    num.fragments = dplyr::first(na.omit(num_fragments)),
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 3) Join metadata onto depth table
+# ----------------------------
+depth_long <- depth_long0 %>%
+  mutate(barcode = as.character(barcode)) %>%
+  left_join(meta_bp_1, by = "barcode")
+
+```
+
+```{r}
+# ============================================================
+# COVERAGE BREADTH SUMMARY FOR FIGURE 4 (cov_long)
+# Computes per-barcode breadth of coverage at depth thresholds:
+#   ≥1×, ≥10×, ≥50×, ≥100×
+#
+# Inputs:
+#   - depth_long : long table with per-position depth
+#   - qc_current : barcode metadata (barcode, sample_type, profile, num.fragments)
+#
+# Output:
+#   - cov_long : long table used for Figure 4
+# ============================================================
+
+# Optional profile-only versions
+# depth_use <- depth_long %>% filter(profile == "strict")
+# depth_use <- depth_long %>% filter(profile == "moderate")
+# depth_use <- depth_long %>% filter(profile == "relaxed")
+
+depth_use <- depth_long
+
+# Barcode -> sample_type mapping
+sample_type_df <- qc_current %>%
+  select(barcode, sample_type) %>%
+  distinct()
+
+# Per-barcode coverage breadth at each threshold
+cov_stats <- depth_use %>%
+  mutate(DP = as.numeric(DP)) %>%
+  group_by(barcode) %>%
+  summarise(
+    cov_1x   = mean(DP >= 1,   na.rm = TRUE),
+    cov_10x  = mean(DP >= 10,  na.rm = TRUE),
+    cov_50x  = mean(DP >= 50,  na.rm = TRUE),
+    cov_100x = mean(DP >= 100, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cov_plot_df <- cov_stats %>%
+  left_join(sample_type_df, by = "barcode") %>%
+  mutate(sample_type = factor(sample_type, levels = c("tissue","eDNA")))
+
+# Long format for plotting
+cov_long <- cov_plot_df %>%
+  pivot_longer(
+    cols = starts_with("cov_"),
+    names_to = "coverage_level",
+    values_to = "proportion"
+  ) %>%
+  mutate(
+    coverage_level = factor(
+      coverage_level,
+      levels = c("cov_1x","cov_10x","cov_50x","cov_100x"),
+      labels = c("≥1×","≥10×","≥50×","≥100×")
+    )
+  ) %>%
+  filter(sample_type %in% c("tissue","eDNA"))
+```
+
+```{r}
+# ============================================================
+# FIGURE 4a
+# Breadth of mitogenome coverage across depth thresholds
+#     comparing tissue vs eDNA samples
+#
+# Required object:
+#   cov_long
+# ============================================================
+
+p_cov_box <- ggplot(
+  cov_long,
+  aes(x = sample_type, y = proportion, fill = sample_type)
+) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.8) +
+  facet_wrap(~ coverage_level, ncol = 2) +
+  scale_fill_manual(values = c(tissue = "grey20", eDNA = "orchid2")) +
+  labs(
+    title = "Breadth of coverage comparison between tissue and eDNA samples",
+    x = "",
+    y = "Proportion of genome covered",
+    fill = "Sample type"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+p_cov_box
+```
+```{r}
+# ============================================================
+# FIGURE 4b
+# Coverage decay curves per barcode across depth thresholds
+# ============================================================
+
+p_cov_decay <- ggplot(
+  cov_long,
+  aes(
+    x = coverage_level,
+    y = proportion,
+    group = barcode,
+    color = sample_type
+  )
+) +
+  geom_line(alpha = 0.35) +
+  geom_point(size = 1) +
+  scale_color_manual(values = c(tissue = "grey20", eDNA = "orchid2")) +
+  labs(
+    x = "Minimum depth threshold",
+    y = "Proportion of mitogenome covered",
+    color = "Sample type"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+p_cov_decay
+```
+
+```{r}
+# ============================================================
+# ALT-SITE COUNTING PER BARCODE (within Tier-3 panel)
+# For each profile:
+#   - Compares REF-filled hapmat base calls to the REF base at each panel position
+#   - Summarizes, per barcode:
+#       n_panel_sites = number of panel positions evaluated
+#       n_alt_sites   = number of positions where base != REF_base
+#
+# Inputs:
+#   - profile_results : list from Tier-3 pipeline
+#   - qc_current : barcode metadata with sample_type
+#
+# Output objects:
+#   - barcode_snp_counts : per-barcode ALT-site counts for each profile
+# ============================================================
+
+barcode_alt_counts <- function(res, profile_name) {
+
+  panel_pos <- res$tier3$panel %>%
+    select(CHROM, POS) %>%
+    distinct()
+
+  # Reference base at each panel position
+  ref_by_pos <- res$snps %>%
+    semi_join(panel_pos, by = c("CHROM","POS")) %>%
+    group_by(CHROM, POS) %>%
+    summarise(REF_base = dplyr::first(REF), .groups = "drop")
+
+  # hapmat -> long / compare base to reference base
+  hap_long <- res$hapmat %>%
+    pivot_longer(
+      cols = -barcode,
+      names_to = "POS",
+      values_to = "base"
+    ) %>%
+    mutate(POS = as.double(POS)) %>%
+    left_join(ref_by_pos, by = "POS") %>%   # NOTE: join by POS only
+    mutate(is_alt = !is.na(REF_base) & base != REF_base)
+
+  hap_long %>%
+    summarise(
+      profile       = profile_name,
+      n_panel_sites = dplyr::n_distinct(POS),
+      n_alt_sites   = sum(is_alt, na.rm = TRUE),
+      .by = barcode
+    ) %>%
+    left_join(qc_current %>% select(barcode, sample_type), by = "barcode")
+}
+
+barcode_snp_counts <- purrr::imap_dfr(profile_results, barcode_alt_counts)
+
+barcode_snp_counts %>%
+  arrange(profile, sample_type, desc(n_alt_sites))
+```
+
+```{r}
+# ============================================================
+# SUPPORTING FIGURE 4
+# Breadth vs number of LR-PCR fragments amplified (tissue vs eDNA)
+#
+# Required object:
+#   qc_current
+#
+# Outputs:
+#   - p_supp4_breadth10_by_frags
+#   - p_supp4_breadth1_by_frags
+#   - p_supp4_breadth10_by_frags_profile
+# ============================================================
+
+# S4a: Breadth at ≥10× by fragments (qc_current)
+p_supp4_breadth10_by_frags <- ggplot(
+  qc_current,
+  aes(x = factor(num_fragments), y = breadth_10x, fill = sample_type)
+) +
+  geom_boxplot() +
+  scale_fill_manual(values = c(tissue = "lightgrey", eDNA = "orchid2")) +
+  theme_bw() +
+  labs(
+    x = "Number of LR-PCR fragments amplified",
+    y = "Breadth at ≥10× depth",
+    fill = "Sample type"
+  )
+
+p_supp4_breadth10_by_frags
+
+# S4b: Breadth at ≥1× by fragments (qc_current)
+p_supp4_breadth1_by_frags <- ggplot(
+  qc_current,
+  aes(x = factor(num_fragments), y = breadth_1x, fill = sample_type)
+) +
+  geom_boxplot() +
+  scale_fill_manual(values = c(tissue = "lightgrey", eDNA = "orchid2")) +
+  theme_bw() +
+  labs(
+    x = "Number of LR-PCR fragments amplified",
+    y = "Breadth at ≥1× depth",
+    fill = "Sample type"
+  )
+
+p_supp4_breadth1_by_frags
+
+# S4c: Breadth ≥10× by fragments, faceted by profile (qc_current)
+p_supp4_breadth10_by_frags_profile <- ggplot(
+  qc_current,
+  aes(x = factor(num_fragments), y = breadth_10x, fill = sample_type)
+) +
+  geom_boxplot() +
+  facet_wrap(~ profile) +
+  scale_fill_manual(values = c("tissue" = "grey70", "eDNA" = "orchid2")) +
+  theme_bw() +
+  labs(
+    x = "Fragments amplified",
+    y = "Breadth at ≥10×",
+    fill = "Sample type"
+  )
+
+p_supp4_breadth10_by_frags_profile
+```
+
+```{r}
+# ============================================================
+# SUPPORTING FIGURE 5
+# ALT sites (panel) vs breadth ≥10×, faceted by profile
+#
+# Required object:
+#   qc_current 
+#
+# Output:
+#   - p_supp5_alt_vs_cov
+# ============================================================
+
+p_supp5_alt_vs_cov <- ggplot(
+  qc_current,
+  aes(x = breadth_10x, y = n_alt_sites, color = sample_type)
+) +
+  geom_point(alpha = 0.8) +
+  facet_wrap(~ profile, nrow = 1) +
+  theme_bw() +
+  scale_color_manual(
+    name = "Sample type",
+    values = c("tissue" = "grey70", "eDNA" = "orchid2")
+  ) +
+  labs(
+    x = "Breadth ≥10x",
+    y = "ALT sites (panel)",
+    fill = "Sample type"
+  )
+
+p_supp5_alt_vs_cov
+
+```
+
+
+```{r}
+# ============================================================
+# PANEL GENOMIC DISTRIBUTION (Tier-3 SNP positions)
+#
+# Builds a combined table of SNP positions from each profile's
+#     panel and visualizes their genomic distribution
+#
+# Required object:
+#   profile_results
+#
+# Output:
+#   panel_pos_all : long table of panel SNP positions
+#   p_panel_dist  : histogram plot of SNP distribution across genome
+# ============================================================
+
+prof_levels <- c("strict","moderate","relaxed")
+
+panel_pos_all <- purrr::imap_dfr(profile_results, \(res, profile_name) {
+  res$tier3$panel %>%
+    transmute(
+      profile = profile_name,
+      POS     = as.double(POS)
+    )
+}) %>%
+  mutate(profile = factor(profile, levels = prof_levels))
+
+p_panel_dist <- ggplot(panel_pos_all, aes(x = POS)) +
+  geom_histogram(bins = 60) +
+  facet_wrap(~ profile, nrow = 1, scales = "free_y") +
+  theme_bw() +
+  labs(
+    x = "Mitogenome position (bp)",
+    y = "Number of panel SNPs",
+    title = "Panel genomic distribution (Tier-3 SNP positions)"
+  )
+
+p_panel_dist
+```
+
+```{r}
+# ============================================================
+# ALT-support by position, split by tissue vs eDNA
+#
+# Counts the number of barcodes supporting a high-confidence ALT
+#   allele at each panel position, separated by sample type
+#
+# Required objects:
+#   profile_results  : list of Tier-3 results for each profile
+#   panel_pos_all    : table of Tier-3 panel SNP positions
+#   prof_levels      : factor ordering for profiles
+#
+# Output:
+#   alt_support_by_pos : ALT-support calls per barcode/position
+#   alt_pos_counts     : number of ALT-supporting barcodes per position
+# ============================================================
+
+alt_support_by_pos <- purrr::imap_dfr(profile_results, \(res, profile_name) {
+
+  vaf_low    <- res$params$vaf_low
+  min_alt_hi <- res$params$min_alt_hi
+
+  res$snps %>%
+    mutate(
+      profile  = profile_name,
+      POS      = as.double(POS),
+      pass_alt = !is.na(vaf) & vaf >= vaf_low & alt_count >= min_alt_hi
+    ) %>%
+    filter(pass_alt) %>%
+    semi_join(
+      panel_pos_all %>% filter(profile == profile_name),
+      by = c("profile","POS")
+    ) %>%
+    distinct(profile, POS, barcode, sample_type) %>%
+    mutate(sample_type = factor(sample_type, levels = c("tissue","eDNA")))
+
+}) %>%
+  mutate(profile = factor(profile, levels = prof_levels))
+
+# Count ALT-supporting barcodes per position
+alt_pos_counts <- alt_support_by_pos %>%
+  count(profile, sample_type, POS, name = "n_alt_barcodes")
+```
+
+```{r}
+# ============================================================
+# BUILD alleles_panel + pos_support (used for Figure 5a)
+#
+# Goal:
+#   1) Convert each profile's REF-filled hapmat into a long allele table
+#   2) Attach REF_base per position and barcode sample_type (tissue/eDNA)
+#   3) Restrict to Tier-3 panel positions -> alleles_panel
+#   4) Summarize ALT support by position & sample_type -> pos_support
+#
+# Required objects:
+#   - profile_results : list from run_profile() for strict/moderate/relaxed
+#       each res contains $hapmat, $snps, $tier3$panel
+#   - qc_current
+#
+# Output objects:
+#   - alleles_panel : long allele table at Tier-3 panel positions
+#       columns include: profile, barcode, POS, allele, sample_type, REF_base, is_alt
+#   - pos_support   : ALT-support summary by profile x POS (tissue vs eDNA counts)
+#       columns include: profile, POS, tissue, eDNA
+# ============================================================
+
+# ----------------------------
+# Long allele table from hapmat (barcode + SNP columns)
+# ----------------------------
+hapmat_to_long <- function(hapmat, profile_name) {
+  tibble::as_tibble(hapmat) %>%
+    tidyr::pivot_longer(
+      cols = -barcode,
+      names_to = "POS",
+      values_to = "allele"
+    ) %>%
+    dplyr::mutate(
+      profile = profile_name,
+      POS = as.double(POS),
+      barcode = as.character(barcode)
+    )
+}
+
+# ----------------------------
+# 1) Long alleles from hapmat for all profiles
+# ----------------------------
+alleles_long <- purrr::imap_dfr(profile_results, \(res, profile_name) {
+  hapmat_to_long(res$hapmat, profile_name)
+})
+
+# ----------------------------
+# 2) REF base per profile x POS (from SNP tables)
+# ----------------------------
+ref_long <- purrr::imap_dfr(profile_results, \(res, profile_name) {
+  res$snps %>%
+    dplyr::transmute(
+      profile  = profile_name,
+      POS      = as.double(POS),
+      REF_base = as.character(REF)
+    ) %>%
+    dplyr::distinct()
+})
+
+# ----------------------------
+# 3) Barcode -> sample_type lookup (from qc_current)
+# ----------------------------
+bc_type <- qc_current %>%
+  dplyr::select(profile, barcode, sample_type) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(
+    profile = as.character(profile),
+    barcode = as.character(barcode)
+  )
+
+# ----------------------------
+# 4) Attach sample_type + REF_base / define is_alt
+# ----------------------------
+alleles_long2 <- alleles_long %>%
+  dplyr::mutate(profile = as.character(profile)) %>%
+  dplyr::left_join(bc_type,  by = c("profile","barcode")) %>%
+  dplyr::left_join(ref_long, by = c("profile","POS")) %>%
+  dplyr::mutate(
+    is_alt = !is.na(REF_base) & !is.na(allele) & allele != REF_base
+  ) %>%
+  dplyr::filter(!is.na(sample_type))
+
+# ----------------------------
+# 5) panel positions per profile
+# ----------------------------
+panel_pos <- purrr::imap_dfr(profile_results, \(res, profile_name) {
+  res$tier3$panel %>%
+    dplyr::transmute(
+      profile = profile_name,
+      POS     = as.double(POS)
+    ) %>%
+    dplyr::distinct()
+})
+
+# ----------------------------
+# 6) Restrict to panel -> alleles_panel
+# ----------------------------
+alleles_panel <- alleles_long2 %>%
+  dplyr::inner_join(panel_pos, by = c("profile","POS"))
+
+# ----------------------------
+# 7) ALT-support summary by profile x POS (counts of ALT calls in tissue vs eDNA)
+# ----------------------------
+pos_support <- alleles_panel %>%
+  dplyr::group_by(profile, POS, sample_type) %>%
+  dplyr::summarise(
+    n_alt = sum(is_alt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = sample_type,
+    values_from = n_alt,
+    values_fill = 0
+  ) %>%
+  dplyr::mutate(
+    tissue = if ("tissue" %in% names(.)) tissue else 0,
+    eDNA   = if ("eDNA"   %in% names(.)) eDNA   else 0
+  )
+
+# cHECK
+pos_support %>% summarise(
+  n_positions   = dplyr::n(),
+  n_edna_zero   = sum(eDNA == 0),
+  n_tissue_zero = sum(tissue == 0)
+)
+```
+
+```{r}
+# ============================================================
+# FIGURE 5a: Genomic positions of Tier-3 SNPs (shared vs tissue-only)
+#
+# Required object:
+#   pos_support with columns:
+#     - profile
+#     - POS
+#     - support_class
+#
+# Output:
+#   - p_rug
+# ============================================================
+
+p_rug <- ggplot(pos_support, aes(x = POS, y = 0)) +
+
+  # plot grey first (tissue-only)
+  geom_point(
+    data = dplyr::filter(pos_support, support_class == "tissue only"),
+    aes(color = support_class),
+    size = 1.6, alpha = 1
+  ) +
+
+  # green second (shared)
+  geom_point(
+    data = dplyr::filter(pos_support, support_class == "Shared (tissue + eDNA)"),
+    aes(color = support_class),
+    size = 1.6, alpha = 1
+  ) +
+
+  facet_wrap(~ profile, ncol = 1) +
+  scale_x_continuous(limits = c(1, 16500)) +
+  scale_color_manual(
+    values = c(
+      "Shared (tissue + eDNA)" = "#008B45",
+      "tissue only"            = "grey55"
+    ),
+    breaks = c("Shared (tissue + eDNA)", "tissue only")
+  ) +
+  theme_bw() +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  ) +
+  labs(x = "Mitogenome position (bp)", color = NULL)
+
+p_rug
+```
+
+```{r}
+# ============================================================
+# FIGURE 5b: ALT-support by mitogenome position within panel
+# Required object:
+#   - alt_pos_counts
+# ============================================================
+
+p_panel_dist_split <- ggplot(
+  alt_pos_counts,
+  aes(x = POS, weight = n_alt_barcodes, fill = sample_type)
+) +
+  geom_histogram(bins = 60, position = "identity", alpha = 0.6) +
+  facet_wrap(~ profile, nrow = 1, scales = "free_y") +
+  scale_fill_manual(
+    values = c(
+      "tissue" = "grey70",
+      "eDNA"   = "orchid2"
+    )
+  ) +
+  theme_bw() +
+  labs(
+    x = "Mitogenome position (bp)",
+    y = "SNP support (sum of barcodes with ALT at site)",
+    fill = "Sample type"
+  )
+
+p_panel_dist_split
+```
+```{r}
+# ============================================================
+# CALLABILITY SUPPORT PER POSITION (callability_pos)
+# Counts # barcodes with DP >= 10 at each POS, split by sample_type, per profile
+#
+# Required objects:
+#   - depth_long  : columns barcode, POS, DP, profile, sample_type
+#   - qc_current
+#
+# Output:
+#   - callability_pos : columns profile, POS, sample_type, n_callable
+# ============================================================
+
+# Ensure depth_long has profile + sample_type (safe no-op if already present)
+depth_long2 <- depth_long %>%
+  mutate(
+    barcode = as.character(barcode),
+    POS     = as.double(POS),
+    DP      = as.double(DP)
+  ) %>%
+  { if (all(c("profile","sample_type") %in% names(.))) . else
+      left_join(
+        qc_current %>%
+          transmute(
+            barcode     = as.character(barcode),
+            profile     = as.character(profile),
+            sample_type = as.character(sample_type)
+          ) %>%
+          distinct(),
+        by = "barcode"
+      )
+  }
+
+callability_pos <- depth_long2 %>%
+  filter(sample_type %in% c("tissue","eDNA")) %>%
+  mutate(callable10 = DP >= 10) %>%
+  group_by(profile, POS, sample_type) %>%
+  summarise(
+    n_callable = sum(callable10, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    profile     = factor(profile, levels = c("strict","moderate","relaxed")),
+    sample_type = factor(sample_type, levels = c("tissue","eDNA"))
+  )
+```
+
+```{r}
+# ============================================================
+# FIGURE 5c INPUT: callability_pos (DP >= 10 across mitogenome)
+# Proportion/callability proxy = # barcodes with DP >= 10 at each POS
+#     Split by sample_type, faceted by profile
+#
+# Required objects:
+#   - depth_long : long depth table from *_clean.depth
+#       must include barcode, POS, DP
+#   - qc_current
+#
+# Output:
+#   - callability_pos : profile, POS, sample_type, n_callable
+# ============================================================
+
+prof_levels <- c("strict","moderate","relaxed")
+
+depth_all <- depth_long %>%
+  dplyr::transmute(
+    barcode = as.character(barcode),
+    POS     = as.double(POS),
+    DP      = as.double(DP)
+  )
+
+# Attach profile + sample_type from qc_current
+depth_all <- depth_all %>%
+  dplyr::left_join(
+    qc_current %>%
+      dplyr::transmute(
+        barcode     = as.character(barcode),
+        profile     = as.character(profile),
+        sample_type = as.character(sample_type)
+      ) %>%
+      dplyr::distinct(),
+    by = "barcode"
+  ) %>%
+  dplyr::filter(sample_type %in% c("tissue","eDNA")) %>%
+  dplyr::mutate(
+    profile     = factor(profile, levels = prof_levels),
+    sample_type = factor(sample_type, levels = c("tissue","eDNA"))
+  )
+
+# Count callable barcodes per position
+callability_pos <- depth_all %>%
+  dplyr::mutate(callable10 = DP >= 10) %>%
+  dplyr::group_by(profile, POS, sample_type) %>%
+  dplyr::summarise(
+    n_callable = sum(callable10, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+# ============================================================
+# FIGURE 5c: Callability support (DP ≥ 10) by position
+# Required object:
+#   - callability_pos: columns profile, sample_type, POS, n_callable
+# ============================================================
+
+p_callability_pos <- ggplot(
+  callability_pos,
+  aes(x = POS, y = n_callable, fill = sample_type)
+) +
+  geom_col(position = "identity", alpha = 0.7) +
+  facet_wrap(~ profile) +
+  scale_fill_manual(
+    values = c(
+      "tissue" = "grey80",
+      "eDNA"   = "orchid2"
+    )
+  ) +
+  theme_bw() +
+  labs(
+    x = "Mitogenome position (bp)",
+    y = "Callability support\n(# barcodes with DP ≥ 10)",
+    fill = "Sample type"
+  )
+
+p_callability_pos
+```
+```{r}
+# ============================================================
+# Build conc_plot (SNP-level concordance table) for:
+#   - Figure 6 tile heatmaps
+#   - Supporting Figure 6 (>=80%)
+#
+# Required objects:
+#   - alleles_panel: profile, barcode, POS, allele, sample_type
+#   - paired_samples_subset.csv
+#
+# Output:
+#   - pairs_one / pairs_tbl
+#   - panel_index
+#   - conc_plot: profile, tissue_barcode, edna_barcode, POS, tissue_allele, edna_allele,
+#                status, snp_index, pair_id
+# ============================================================
+
+prof_levels <- c("strict","moderate","relaxed")
+
+# 1) Read paired table
+paired_samples <- readr::read_csv("paired_samples_subset.csv", show_col_types = FALSE) %>%
+  dplyr::mutate(
+    profile     = as.character(profile),
+    sample_type = tolower(as.character(sample_type)),
+    barcode     = as.character(barcode),
+    sample_pair = dplyr::na_if(as.character(sample_pair), "NA")
+  ) %>%
+  dplyr::filter(profile %in% prof_levels)
+
+# 2) One row per true tissue–eDNA pair
+pairs_one <- paired_samples %>%
+  dplyr::filter(!is.na(sample_pair)) %>%
+  dplyr::mutate(
+    tissue_barcode = dplyr::case_when(
+      sample_type == "tissue" ~ barcode,
+      sample_type == "edna"   ~ sample_pair,
+      TRUE ~ NA_character_
+    ),
+    edna_barcode = dplyr::case_when(
+      sample_type == "edna"   ~ barcode,
+      sample_type == "tissue" ~ sample_pair,
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::filter(!is.na(tissue_barcode), !is.na(edna_barcode)) %>%
+  dplyr::mutate(
+    pair_id = paste(tissue_barcode, "vs", edna_barcode),
+    profile = factor(profile, levels = prof_levels) 
+  ) %>%
+  dplyr::distinct(profile, pair_id, tissue_barcode, edna_barcode, .keep_all = TRUE)
+
+pairs_one %>% dplyr::count(profile)
+
+pairs_tbl <- pairs_one %>%
+  dplyr::transmute(
+    profile = as.character(profile),
+    tissue_barcode = as.character(tissue_barcode),
+    edna_barcode   = as.character(edna_barcode),
+    pair_id
+  ) %>%
+  dplyr::distinct()
+
+# 3) Panel SNP index per profile (based on alleles_panel POS set)
+panel_index <- alleles_panel %>%
+  dplyr::transmute(
+    profile = as.character(profile),
+    POS     = as.double(POS)
+  ) %>%
+  dplyr::distinct(profile, POS) %>%
+  dplyr::filter(profile %in% prof_levels) %>%
+  dplyr::arrange(factor(profile, levels = prof_levels), POS) %>%
+  dplyr::group_by(profile) %>%
+  dplyr::mutate(snp_index = dplyr::row_number()) %>%
+  dplyr::ungroup()
+
+# 4) Allele tables (tissue + eDNA) from alleles_panel
+tissue_calls <- alleles_panel %>%
+  dplyr::filter(sample_type == "tissue") %>%
+  dplyr::transmute(
+    profile        = as.character(profile),
+    tissue_barcode = as.character(barcode),
+    POS            = as.double(POS),
+    tissue_allele  = as.character(allele)
+  )
+
+edna_calls <- alleles_panel %>%
+  dplyr::filter(sample_type == "eDNA") %>%
+  dplyr::transmute(
+    profile      = as.character(profile),
+    edna_barcode = as.character(barcode),
+    POS          = as.double(POS),
+    edna_allele  = as.character(allele)
+  )
+
+# 5) Build conc_plot (expand tissue SNPs / join eDNA alleles by POS)
+conc_plot <- pairs_tbl %>%
+  dplyr::left_join(tissue_calls, by = c("profile","tissue_barcode")) %>%          # expands to all tissue SNPs
+  dplyr::left_join(edna_calls,   by = c("profile","edna_barcode","POS")) %>%      # adds eDNA allele if present
+  dplyr::mutate(
+    status = dplyr::case_when(
+      is.na(edna_allele) ~ "no eDNA call",
+      edna_allele == tissue_allele ~ "match",
+      TRUE ~ "mismatch"
+    )
+  ) %>%
+  dplyr::left_join(panel_index, by = c("profile","POS"))
+
+# Check
+conc_plot %>% dplyr::count(profile, status)
+
+conc_plot %>%
+  dplyr::summarise(
+    any_na_index = any(is.na(snp_index)),
+    n_na_index   = sum(is.na(snp_index)),
+    .by = profile
+  )
+```
+```{r}
+# ============================================================
+# Callable positions per barcode (DP >= 10)
+#
+# Required:
+#   depth_long 
+# 
+# Output:
+#   callable_by_barcode: barcode, POS, callable10
+# ============================================================
+
+callable_by_barcode <- depth_long0 %>%
+  dplyr::transmute(
+    barcode = as.character(barcode),
+    POS     = as.double(POS),
+    DP      = as.numeric(DP),
+    callable10 = DP >= 10
+  ) %>%
+  dplyr::distinct(barcode, POS, callable10)
+```
+
+```{r}
+# ============================================================
+# Callable mask for paired comparisons (DP >= 10 in BOTH barcodes)
+# This expands each true pair to the panel POS for that profile
+#   then checks DP>=10 for tissue and eDNA at that POS (profile-independent)
+#
+# Required:
+#   - pairs_tbl: profile, tissue_barcode, edna_barcode, pair_id
+#   - panel_pos_all: profile, POS   (Tier-3 positions per profile)
+#   - callable_by_barcode: barcode, POS, callable10
+#
+# Output:
+#   callable_pairs: profile, pair_id, POS, callable_both
+# ============================================================
+
+callable_pairs <- pairs_tbl %>%
+  dplyr::mutate(
+    profile = as.character(profile),
+    tissue_barcode = as.character(tissue_barcode),
+    edna_barcode   = as.character(edna_barcode),
+    pair_id        = as.character(pair_id)
+  ) %>%
+  dplyr::inner_join(
+    panel_pos_all %>%
+      dplyr::mutate(profile = as.character(profile),
+                    POS = as.double(POS)),
+    by = "profile"
+  ) %>%
+  dplyr::left_join(
+    callable_by_barcode %>%
+      dplyr::rename(tissue_barcode = barcode, callable_tissue = callable10),
+    by = c("tissue_barcode","POS")
+  ) %>%
+  dplyr::left_join(
+    callable_by_barcode %>%
+      dplyr::rename(edna_barcode = barcode, callable_edna = callable10),
+    by = c("edna_barcode","POS")
+  ) %>%
+  dplyr::mutate(
+    callable_tissue = dplyr::coalesce(callable_tissue, FALSE),
+    callable_edna   = dplyr::coalesce(callable_edna,   FALSE),
+    callable_both   = callable_tissue & callable_edna
+  ) %>%
+  dplyr::select(profile, pair_id, POS, callable_both) %>%
+  dplyr::distinct()
+
+# Check
+callable_pairs %>% dplyr::count(profile, callable_both)
+```
+
+```{r}
+# ============================================================
+# SUPPORTING FIGURE 6 (callable-only)
+# Uses conc_plot + callable_pairs to compute per-SNP agreement
+#   among callable pairs only (DP>=10 in BOTH barcodes at that POS)
+# ============================================================
+
+pair_alleles2_new <- conc_plot %>%
+  dplyr::mutate(
+    profile = as.character(profile),
+    POS     = as.double(POS),
+    snp_index = as.integer(snp_index),
+    pair_id = paste(tissue_barcode, "vs", edna_barcode)
+  ) %>%
+  dplyr::left_join(callable_pairs, by = c("profile","pair_id","POS")) %>%
+  dplyr::mutate(callable_both = dplyr::coalesce(callable_both, FALSE)) %>%
+  dplyr::transmute(
+    profile,
+    edna_barcode   = as.character(edna_barcode),
+    tissue_barcode = as.character(tissue_barcode),
+    POS,
+    snp_index,
+    allele_edna   = dplyr::na_if(as.character(edna_allele), "N"),
+    allele_tissue = dplyr::na_if(as.character(tissue_allele), "N"),
+    callable_both,
+    pair_id
+  ) %>%
+  dplyr::mutate(
+    both_called = callable_both & !is.na(allele_edna) & !is.na(allele_tissue),
+    match       = both_called & (allele_edna == allele_tissue)
+  )
+
+per_snp_agree_new <- pair_alleles2_new %>%
+  dplyr::group_by(profile, POS, snp_index) %>%
+  dplyr::summarise(
+    n_pairs    = dplyr::n_distinct(pair_id),
+    n_called   = sum(both_called, na.rm = TRUE),
+    n_match    = sum(match, na.rm = TRUE),
+    agree_rate = ifelse(n_called > 0, n_match / n_called, NA_real_),
+    .groups = "drop"
+  )
+
+diag_df2_new <- per_snp_agree_new %>%
+  dplyr::group_by(profile) %>%
+  dplyr::arrange(snp_index, .by_group = TRUE) %>%
+  dplyr::mutate(shared = !is.na(agree_rate) & agree_rate >= 0.8) %>%
+  dplyr::ungroup()
+
+per_snp_agree_new %>%
+  dplyr::group_by(profile) %>%
+  dplyr::summarise(
+    min_called = min(n_called, na.rm = TRUE),
+    med_called = median(n_called, na.rm = TRUE),
+    max_called = max(n_called, na.rm = TRUE),
+    n_na_agree = sum(is.na(agree_rate)),
+    .groups = "drop"
+  )
+
+diag_df2_new <- per_snp_agree_new %>%
+  mutate(shared = !is.na(agree_rate) & agree_rate >= 0.8)
+
+diag_df2_new %>% count(profile, shared)
+
+plot_diag_one2 <- function(df, prof) {
+  d <- df %>% filter(profile == prof) %>% mutate(snp_index = as.integer(snp_index))
+  stopifnot(nrow(d) > 0)
+
+  max_i <- max(d$snp_index, na.rm = TRUE)
+
+  ggplot(d, aes(x = snp_index, y = snp_index)) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    geom_point(data = d %>% filter(shared), size = 1.6) +
+    coord_equal(xlim = c(1, max_i), ylim = c(1, max_i)) +
+    theme_bw() +
+    labs(
+      title = paste0(prof, " panel (", max_i, " SNPs)"),
+      subtitle = "Dots = SNPs with ≥80% allele agreement across\npaired eDNA–tissue (among callable pairs)",
+      x = "SNP",
+      y = "SNP"
+    )
+}
+
+p_strict2   <- plot_diag_one2(diag_df2_new, "strict")
+p_moderate2 <- plot_diag_one2(diag_df2_new, "moderate")
+p_relaxed2  <- plot_diag_one2(diag_df2_new, "relaxed")
+
+p_strict2
+p_moderate2
+p_relaxed2
+```
+```{r}
+# ============================================================
+# How many true tissue–eDNA pairs per profile?
+#
+# Required object:
+#   - pairs_one
+#
+# Output:
+#   - pairs_summary: n_pairs per profile
+# ============================================================
+
+pairs_summary <- pairs_one %>%
+  dplyr::count(profile, name = "n_pairs")
+
+pairs_summary
+```
+
+```{r}
+# ============================================================
+# HAPLOTYPES + HAPLOGROUPS (pegas + ape)
+# Required: 
+#   - profile_results
+#   - qc_current      
+#   - pairs_one  
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(ape)
+library(pegas)
+
+# -----------------------------
+# Profile ordering + caps
+# -----------------------------
+prof_levels <- c("strict","moderate","relaxed")
+caps <- c(10, 20, 30)
+
+# ============================================================
+# 1) Make hapmat safe for ape/pegas
+#    (remove list-cols / enforce single-character A/C/G/T/N)
+# ============================================================
+
+fix_hapmat_listcols <- function(hm, missing_char = "N") {
+  stopifnot("barcode" %in% names(hm))
+
+  hm2 <- hm %>%
+    dplyr::mutate(barcode = as.character(barcode)) %>%
+    dplyr::mutate(
+      dplyr::across(-barcode, \(x) {
+        if (is.list(x)) {
+          purrr::map_chr(x, \(v) {
+            v <- as.character(v)
+            v <- v[!is.na(v)]
+            if (length(v) == 0) NA_character_ else v[1]
+          })
+        } else {
+          as.character(x)
+        }
+      })
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(-barcode, \(x) {
+        x[is.na(x)] <- missing_char
+        x <- toupper(x)
+        x[!x %in% c("A","C","G","T","N")] <- missing_char
+        x
+      })
+    )
+
+  hm2
+}
+
+# Apply to all profiles 
+profile_results <- purrr::imap(profile_results, \(res, prof) {
+  res$hapmat <- fix_hapmat_listcols(res$hapmat, missing_char = "N")
+  res
+})
+
+# QC
+hm <- profile_results$strict$hapmat
+stopifnot(!anyDuplicated(names(hm)[names(hm) != "barcode"]))
+stopifnot(!any(purrr::map_lgl(hm, is.list)))
+tmp <- hm %>% dplyr::select(-barcode) %>% dplyr::mutate(dplyr::across(dplyr::everything(), as.character)) %>% as.matrix()
+bad_vals <- unique(tmp[!is.na(tmp) & nchar(tmp) != 1])
+if (length(bad_vals) > 0) {
+  message("WARNING: Found non-1-char alleles (first few): ", paste(head(bad_vals, 10), collapse = ", "))
+}
+
+# ============================================================
+# 2) Pegas haplotypes from hapmat (per profile)
+#    - creates hap_per_profile (dna + haplotype object + barcode assignments)
+#    - creates hap_table (barcode-level haplotype membership)
+# ============================================================
+
+# Unique lookup for sample_type 
+bc_type <- qc_current %>%
+  dplyr::transmute(
+    profile     = as.character(profile),
+    barcode     = as.character(barcode),
+    sample_type = as.character(sample_type)
+  ) %>%
+  dplyr::distinct(profile, barcode, sample_type)
+
+call_haps_from_hapmat <- function(hapmat) {
+  stopifnot("barcode" %in% names(hapmat))
+
+  dna <- hapmat %>%
+    dplyr::mutate(barcode = as.character(barcode)) %>%
+    tibble::column_to_rownames("barcode") %>%
+    as.matrix() %>%
+    ape::as.DNAbin()
+
+  h <- pegas::haplotype(dna)
+  idx <- attr(h, "index")
+  hap_names <- rownames(h)
+
+  hap_assign <- purrr::map_dfr(seq_along(idx), \(i) {
+    tibble::tibble(
+      barcode  = rownames(dna)[ idx[[i]] ],
+      haplotype = hap_names[i]
+    )
+  })
+
+  list(dna = dna, h = h, hap_assign = hap_assign)
+}
+
+hap_per_profile <- purrr::imap(profile_results, \(res, prof) {
+  out <- call_haps_from_hapmat(res$hapmat)
+  out$profile <- as.character(prof)
+  out
+})
+
+hap_table <- purrr::imap_dfr(hap_per_profile, \(obj, prof) {
+  obj$hap_assign %>% dplyr::mutate(profile = as.character(prof))
+}) %>%
+  dplyr::left_join(bc_type, by = c("profile","barcode"))
+
+# ============================================================
+# 3) Haplogroups by cap (hierarchical clustering on haplotypes)
+#    - uses ape::dist.dna on the haplotype object (obj$h)
+#    - picks smallest cut height giving <= cap groups
+# ============================================================
+
+haplogroups_by_cap <- function(h_obj, cap = 20) {
+  d  <- ape::dist.dna(h_obj, model = "raw", pairwise.deletion = TRUE)
+  hc <- stats::hclust(d, method = "average")
+
+  grid <- seq(0.0005, 0.20, by = 0.0005)
+  n_groups <- vapply(grid, \(h) length(unique(stats::cutree(hc, h = h))), integer(1))
+
+  i <- which(n_groups <= cap)[1]
+  if (is.na(i)) i <- length(grid)
+
+  grp <- stats::cutree(hc, h = grid[i])
+
+  map <- tibble::tibble(
+    haplotype = names(grp),
+    haplogroup = paste0("HG", grp)
+  )
+
+  list(map = map, n_groups = length(unique(grp)), h_used = grid[i])
+}
+
+# ============================================================
+# 4) SUPPORTING FIGURE 2: cap (10/20/30) vs eDNA capture
+#       capture = proportion of eDNA barcodes in haplogroups that contain tissue
+# ============================================================
+
+edna_capture_cap <- purrr::imap_dfr(hap_per_profile, \(obj, prof) {
+  prof <- as.character(prof)
+
+  purrr::map_dfr(caps, \(cap_now) {
+
+    hg <- haplogroups_by_cap(obj$h, cap = cap_now)
+
+    barcode_hg <- hap_table %>%
+      dplyr::filter(profile == prof) %>%
+      dplyr::left_join(hg$map, by = "haplotype")
+
+    hg_flags <- barcode_hg %>%
+      dplyr::group_by(haplogroup) %>%
+      dplyr::summarise(has_tissue = any(sample_type == "tissue"), .groups = "drop")
+
+    prop <- barcode_hg %>%
+      dplyr::filter(sample_type == "eDNA") %>%
+      dplyr::left_join(hg_flags, by = "haplogroup") %>%
+      dplyr::summarise(prop = mean(has_tissue, na.rm = TRUE)) %>%
+      dplyr::pull(prop)
+
+    tibble::tibble(profile = prof, cap = cap_now, prop_edna_in_tissue_hg = prop)
+  })
+}) %>%
+  dplyr::mutate(profile = factor(profile, levels = prof_levels))
+
+
+p_capture_vs_cap <- ggplot2::ggplot(edna_capture_cap,
+                                   ggplot2::aes(x = cap, y = prop_edna_in_tissue_hg)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point() +
+  ggplot2::facet_wrap(~ profile, nrow = 1) +
+  ggplot2::theme_bw() +
+  ggplot2::labs(
+    x = "Haplogroup cap (max groups)",
+    y = "Proportion of eDNA in tissue-containing haplogroups"
+  )
+
+p_capture_vs_cap
+
+# ============================================================
+# 5) Final haplogroup assignment at cap = 20
+#    - outputs:
+#       haplogroup_map_cap20 (haplotype -> haplogroup)
+#       barcode_haps_hg_cap20 (barcode-level haplotype + haplogroup)
+#       hap_membership_hg_cap20 (hap_table + haplogroup attached)
+# ============================================================
+
+cap_final <- 20
+
+haplogroup_map_cap20 <- purrr::imap_dfr(hap_per_profile, \(obj, prof) {
+  prof <- as.character(prof)
+  hg <- haplogroups_by_cap(obj$h, cap = cap_final)
+
+  hg$map %>%
+    dplyr::transmute(
+      profile   = prof,
+      haplotype = as.character(haplotype),
+      haplogroup = as.character(haplogroup)
+    )
+})
+
+barcode_haps_hg_cap20 <- hap_table %>%
+  dplyr::transmute(
+    profile    = as.character(profile),
+    barcode    = as.character(barcode),
+    sample_type = as.character(sample_type),
+    haplotype  = as.character(haplotype)
+  ) %>%
+  dplyr::left_join(haplogroup_map_cap20, by = c("profile","haplotype"))
+
+# Check
+barcode_haps_hg_cap20 %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    n_missing_hg = sum(is.na(haplogroup)),
+    .by = profile
+  ) %>% print()
+
+hap_membership_hg_cap20 <- hap_table %>%
+  dplyr::mutate(profile = as.character(profile), barcode = as.character(barcode)) %>%
+  dplyr::left_join(
+    barcode_haps_hg_cap20 %>% dplyr::select(profile, barcode, haplogroup),
+    by = c("profile","barcode")
+  )
+
+# ============================================================
+# 6) Quick counts (haplotypes + haplogroups per profile)
+# ============================================================
+
+hap_counts <- hap_table %>%
+  dplyr::summarise(n_haplotypes = dplyr::n_distinct(haplotype), .by = profile)
+
+hg_counts <- barcode_haps_hg_cap20 %>%
+  dplyr::summarise(n_haplogroups = dplyr::n_distinct(haplogroup), .by = profile)
+
+hap_counts
+hg_counts
+
+# ============================================================
+# 7) Haplogroup concordance in true tissue–eDNA pairs
+#     uses pairs_one and barcode_haps_hg_cap20
+# ============================================================
+
+stopifnot(all(c("profile","tissue_barcode","edna_barcode") %in% names(pairs_one)))
+
+pair_hg <- pairs_one %>%
+  dplyr::transmute(
+    profile = as.character(profile),
+    tissue_barcode = as.character(tissue_barcode),
+    edna_barcode   = as.character(edna_barcode),
+    pair_id = if ("pair_id" %in% names(pairs_one)) as.character(pair_id) else paste(tissue_barcode, "vs", edna_barcode)
+  ) %>%
+  dplyr::left_join(
+    barcode_haps_hg_cap20 %>%
+      dplyr::transmute(profile = as.character(profile),
+                       tissue_barcode = as.character(barcode),
+                       tissue_hg = as.character(haplogroup)),
+    by = c("profile","tissue_barcode")
+  ) %>%
+  dplyr::left_join(
+    barcode_haps_hg_cap20 %>%
+      dplyr::transmute(profile = as.character(profile),
+                       edna_barcode = as.character(barcode),
+                       edna_hg = as.character(haplogroup)),
+    by = c("profile","edna_barcode")
+  )
+
+pair_hg %>%
+  dplyr::summarise(
+    n_pairs = dplyr::n(),
+    n_missing_tissue_hg = sum(is.na(tissue_hg)),
+    n_missing_edna_hg   = sum(is.na(edna_hg)),
+    .by = profile
+  ) %>% print()
+
+hg_concordance <- pair_hg %>%
+  dplyr::mutate(match = !is.na(tissue_hg) & !is.na(edna_hg) & tissue_hg == edna_hg) %>%
+  dplyr::summarise(
+    n_pairs = dplyr::n(),
+    n_scored = sum(!is.na(match)),
+    concordance = mean(match, na.rm = TRUE),
+    .by = profile
+  )
+
+hg_concordance
+
+# ============================================================
+# 8) QC
+# ============================================================
+
+hap_sizes <- barcode_haps_hg_cap20 %>%
+  dplyr::count(profile, haplotype, sample_type, name = "n") %>%
+  tidyr::pivot_wider(names_from = sample_type, values_from = n, values_fill = 0) %>%
+  dplyr::mutate(total = tissue + eDNA)
+
+ggplot2::ggplot(hap_sizes, ggplot2::aes(x = total)) +
+  ggplot2::geom_histogram(binwidth = 1) +
+  ggplot2::facet_wrap(~ profile, nrow = 1) +
+  ggplot2::theme_bw() +
+  ggplot2::labs(x = "Barcodes per haplotype", y = "Number of haplotypes")
+
+# ============================================================
+# 9) Exploratory: ALT-position set overlap (Jaccard) within haplogroups
+# ============================================================
+
+barcode_alt_sets <- purrr::imap_dfr(profile_results, \(res, profile_name) {
+
+  panel_pos <- res$tier3$panel %>%
+    dplyr::select(CHROM, POS) %>%
+    dplyr::distinct()
+
+  ref_by_pos <- res$snps %>%
+    dplyr::semi_join(panel_pos, by = c("CHROM","POS")) %>%
+    dplyr::group_by(CHROM, POS) %>%
+    dplyr::summarise(REF_base = dplyr::first(REF), .groups = "drop")
+
+  res$hapmat %>%
+    tidyr::pivot_longer(cols = -barcode, names_to = "POS", values_to = "base") %>%
+    dplyr::mutate(POS = as.double(POS)) %>%
+    dplyr::left_join(ref_by_pos, by = "POS") %>%  
+    dplyr::mutate(is_alt = !is.na(REF_base) & base != REF_base) %>%
+    dplyr::filter(is_alt) %>%
+    dplyr::distinct(barcode, POS) %>%
+    dplyr::summarise(alt_pos = list(sort(unique(POS))), .by = barcode) %>%
+    dplyr::mutate(profile = as.character(profile_name))
+})
+
+alt_with_groups <- barcode_haps_hg_cap20 %>%
+  dplyr::select(profile, barcode, sample_type, haplogroup, haplotype) %>%
+  dplyr::left_join(barcode_alt_sets, by = c("profile","barcode")) %>%
+  dplyr::mutate(alt_pos = tidyr::replace_na(alt_pos, list(numeric(0))))
+
+overlap_stats <- function(a, b) {
+  inter <- length(intersect(a, b))
+  uni   <- length(union(a, b))
+  tibble::tibble(
+    overlap = inter,
+    union   = uni,
+    jaccard = ifelse(uni > 0, inter/uni, NA_real_)
+  )
+}
+
+hg_overlap <- alt_with_groups %>%
+  dplyr::group_by(profile, haplogroup) %>%
+  dplyr::summarise(
+    tissue_sets = list(alt_pos[sample_type == "tissue"]),
+    edna_sets   = list(alt_pos[sample_type == "eDNA"]),
+    n_tissue    = sum(sample_type == "tissue"),
+    n_eDNA      = sum(sample_type == "eDNA"),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    pair_stats = purrr::pmap(list(tissue_sets, edna_sets), \(tsets, esets) {
+      if (length(tsets) == 0 || length(esets) == 0) return(tibble::tibble())
+      purrr::map_dfr(tsets, \(t) purrr::map_dfr(esets, \(e) overlap_stats(t, e)))
+    })
+  ) %>%
+  tidyr::unnest(pair_stats) %>%
+  dplyr::group_by(profile, haplogroup, n_tissue, n_eDNA) %>%
+  dplyr::summarise(
+    mean_overlap   = mean(overlap, na.rm = TRUE),
+    mean_jaccard   = mean(jaccard, na.rm = TRUE),
+    median_overlap = median(overlap, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+hg_overlap %>%
+  dplyr::arrange(profile, desc(mean_jaccard)) %>%
+  dplyr::slice_head(n = 20)
+```
+
+```{r}
+# ============================================================
+# Pairwise SNP distances from hapmat then extract paired distances
+#
+# Required objects:
+#   profile_results 
+#   paired_samples    
+# ============================================================
+
+compute_dist_matrix <- function(hapmat) {
+
+  hm <- as.data.frame(hapmat)
+
+  # Ensure barcode column exists 
+  if (!("barcode" %in% names(hm))) {
+    rn <- rownames(hm)
+    if (!is.null(rn) && any(grepl("^barcode", rn))) {
+      hm <- hm %>% tibble::rownames_to_column("barcode")
+    } else {
+      names(hm)[1] <- "barcode"
+    }
+  }
+
+  dna <- hm %>%
+    dplyr::select(-barcode) %>%
+    as.matrix() %>%
+    ape::as.DNAbin()
+
+  rownames(dna) <- hm$barcode
+
+  d <- ape::dist.dna(dna, model = "raw", pairwise.deletion = FALSE)
+
+  as.matrix(d)
+}
+
+# ------------------------------------------------------------
+# Compute proportional distance matrices (0–1 scale)
+# ------------------------------------------------------------
+dist_list <- purrr::imap(profile_results, \(res, profile_name) {
+  list(
+    profile = profile_name,
+    dist    = compute_dist_matrix(res$hapmat)
+  )
+})
+
+# Check
+names(profile_results$strict$hapmat)
+head(profile_results$strict$hapmat[, 1:5])
+
+# ------------------------------------------------------------
+# Convert proportional distances -> SNP mismatch counts
+# ------------------------------------------------------------
+dist_counts_list <- purrr::imap(profile_results, \(res, profile_name) {
+
+  hapmat  <- as.data.frame(res$hapmat)
+  n_sites <- ncol(hapmat) - 1  # exclude barcode column
+
+  d_prop  <- dist_list[[profile_name]]$dist
+
+  d_prop * n_sites
+})
+
+# ------------------------------------------------------------
+# Safe distance lookup
+# ------------------------------------------------------------
+safe_lookup <- function(dmat, a, b) {
+
+  a <- as.character(a)
+  b <- as.character(b)
+
+  if (!a %in% rownames(dmat)) return(NA_real_)
+  if (!b %in% colnames(dmat)) return(NA_real_)
+
+  as.numeric(dmat[a, b])
+}
+
+# ------------------------------------------------------------
+# Extract distances for paired eDNA/tissue samples
+# ------------------------------------------------------------
+paired_valid <- paired_samples %>%
+  mutate(
+    profile = as.character(profile),
+    barcode = as.character(barcode),
+    sample_pair = na_if(trimws(as.character(sample_pair)), "NA"),
+    pair_exists_in_profile = if_else(is.na(pair_sample_type), FALSE, TRUE),
+    haplogroup_match = !is.na(pair_haplogroup) & haplogroup == pair_haplogroup,
+    haplotype_match  = !is.na(pair_haplotype)  & haplotype  == pair_haplotype
+  ) %>%
+  filter(!is.na(sample_pair))
+
+paired_dist <- paired_valid %>%
+  mutate(
+    snp_distance = purrr::pmap_dbl(
+      list(profile, barcode, sample_pair),
+      \(profile, barcode, sample_pair) {
+
+        dmat <- dist_counts_list[[as.character(profile)]]
+
+        safe_lookup(dmat, barcode, sample_pair)
+
+      }
+    )
+  )
+
+# Check
+paired_dist %>%
+  filter(is.na(snp_distance)) %>%
+  count(profile)
+
+# ------------------------------------------------------------
+# Histogram of eDNA/tissue SNP distances
+# ------------------------------------------------------------
+paired_dist_edna <- paired_dist %>%
+  filter(sample_type == "eDNA", !is.na(snp_distance))
+
+ggplot(paired_dist_edna, aes(x = snp_distance)) +
+  geom_histogram(binwidth = 1) +
+  facet_wrap(~ profile) +
+  theme_bw() +
+  labs(
+    x = "SNP differences (eDNA vs paired tissue)",
+    y = "Number of pairs"
+  )
+
+# Table of distances
+paired_dist %>%
+  filter(sample_type == "eDNA") %>%
+  select(profile, barcode, sample_pair, snp_distance)
+
+names(qc_current)
+names(paired_valid)
+```
+
+```{r}
+# ============================================================
+# SUPPORTING FIGURE 7
+# Pairwise concordance across callable SNPs for each matched tissue–eDNA pair
+#     Concordance defined as: 1 - (mismatches / called SNPs)
+#
+# Required object:
+#   conc_plot with columns: profile, pair_id, status
+# status values used here:
+#   "match", "mismatch"  (rows with "no eDNA call" are excluded)
+# ============================================================
+
+pair_summary <- conc_plot %>%
+  filter(status %in% c("match", "mismatch")) %>%   # callable comparisons only
+  group_by(profile, pair_id) %>%
+  summarise(
+    n_called    = n(),
+    n_mismatch  = sum(status == "mismatch"),
+    concordance = 1 - (n_mismatch / n_called),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    class = case_when(
+      concordance >= 0.95 ~ "high-confidence match",
+      concordance <= 0.20 ~ "non-match candidate",
+      TRUE                ~ "ambiguous"
+    )
+  )
+
+p_pair_conc <- pair_summary %>%
+  group_by(profile) %>%
+  mutate(pair_id_ord = forcats::fct_reorder(pair_id, concordance)) %>%
+  ungroup() %>%
+  ggplot(aes(x = concordance, y = forcats::fct_rev(pair_id_ord), shape = class)) +
+  geom_point(size = 2) +
+  facet_wrap(~ profile, ncol = 1, scales = "free_y") +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.y = element_text(size = 6)
+  ) +
+  labs(
+    x = "Concordance (1 - mismatches / called SNPs)",
+    y = "Tissue ↔ eDNA pair",
+    shape = NULL
+  )
+
+p_pair_conc
+```
+
+
+```{r}
+# ============================================================
+# FIGURE 6: SNP-level concordance tiles for paired eDNA–tissue samples
+# Required object:
+#   conc_plot
+# ============================================================
+
+base_tile <- function(df, prof) {
+
+  df_prof <- df %>% dplyr::filter(profile == prof)
+  stopifnot(nrow(df_prof) > 0)
+
+  # Order pairs by mismatch rate 
+  pair_levels <- df_prof %>%
+    group_by(pair_id) %>%
+    summarise(
+      mismatch_rate = mean(status == "mismatch", na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(mismatch_rate) %>%
+    pull(pair_id)
+
+  df_prof <- df_prof %>%
+    mutate(pair_id = factor(pair_id, levels = pair_levels)) %>%
+    mutate(pair_id = forcats::fct_rev(pair_id))
+
+  ggplot(df_prof, aes(x = snp_index, y = pair_id, fill = status)) +
+    geom_tile(height = 0.9) +
+    scale_fill_manual(
+      values = c(
+        "match"       = "#5E3C99",
+        "mismatch"    = "#E6E6E6",
+        "no eDNA call" = "red"
+      )
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.y = element_text(size = 6)
+    ) +
+    labs(
+      x = "SNP index",
+      y = "Tissue/eDNA pair",
+      fill = NULL
+    )
+}
+
+p_strict   <- base_tile(conc_plot, "strict")
+p_moderate <- base_tile(conc_plot, "moderate")
+p_relaxed  <- base_tile(conc_plot, "relaxed")
+
+p_strict
+p_moderate
+p_relaxed
+
+```
+```{r}
+# Fix data formatting for subsequent analyses 
+paired_samples <- paired_samples %>% mutate(sample_type = tolower(sample_type))
+qc_current     <- qc_current     %>% mutate(sample_type = tolower(sample_type))
+depth_long     <- depth_long     %>% mutate(sample_type = tolower(sample_type))
+```
+
+
+```{r}
+# ============================================================
+# Paired eDNA–tissue SNP metrics computed directly from alleles_panel
+#     SNP distance and mismatch rate on callable positions
+#
+# Required objects:
+#   qc_current
+#   alleles_panel
+# ============================================================
+true_pairs <- paired_samples %>%
+  mutate(
+    profile     = as.character(profile),
+    barcode     = as.character(barcode),
+    sample_pair = na_if(as.character(sample_pair), "NA")
+  ) %>%
+  filter(sample_type == "edna", !is.na(sample_pair)) %>%   # <-- change
+  transmute(profile, edna_barcode = barcode, tissue_barcode = sample_pair) %>%
+  distinct()
+
+panel_pos <- alleles_panel %>%
+  transmute(
+    profile = as.character(profile),
+    POS     = as.double(POS)
+  ) %>%
+  distinct(profile, POS)
+
+ap <- alleles_panel %>%
+  transmute(
+    profile = as.character(profile),
+    barcode = as.character(barcode),
+    POS     = as.double(POS),
+    allele  = as.character(allele)
+  )
+
+# Expand each true pair to all panel SNP positions
+pair_pos <- true_pairs %>%
+  inner_join(panel_pos, by = "profile")
+
+pair_alleles <- pair_pos %>%
+  left_join(
+    ap %>% rename(edna_barcode = barcode, allele_edna = allele),
+    by = c("profile", "edna_barcode", "POS")
+  ) %>%
+  left_join(
+    ap %>% rename(tissue_barcode = barcode, allele_tissue = allele),
+    by = c("profile", "tissue_barcode", "POS")
+  )
+
+missing <- c(NA, "N", "-", "?")
+
+pair_snp_metrics <- pair_alleles %>%
+  mutate(
+    callable = !(allele_edna %in% missing | allele_tissue %in% missing),
+    mismatch = callable & (allele_edna != allele_tissue)
+  ) %>%
+  group_by(profile, edna_barcode, tissue_barcode) %>%
+  summarise(
+    n_comp = sum(callable, na.rm = TRUE),
+    snp_distance = sum(mismatch, na.rm = TRUE),
+    prop_mismatch_callable = if_else(n_comp > 0, snp_distance / n_comp, NA_real_),
+    .groups = "drop"
+  )
+
+# Profile-level summary 
+pair_snp_metrics %>%
+  group_by(profile) %>%
+  summarise(
+    n_pairs          = n(),
+    n_exact          = sum(snp_distance == 0, na.rm = TRUE),
+    n_one_snp        = sum(snp_distance == 1, na.rm = TRUE),
+    mean_snp_diff    = mean(snp_distance, na.rm = TRUE),
+    mean_prop_mismatch = mean(prop_mismatch_callable, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pair_snp_metrics %>%
+  group_by(profile) %>%
+  summarise(
+    n_pairs    = n(),
+    n_zero_comp = sum(n_comp == 0),
+    min_comp   = min(n_comp),
+    median_comp = median(n_comp),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# ============================================================
+# SUPPORTING FIGURE 8
+# Depth profiles across defining SNP positions, grouped by haplogroup
+# - Facets are haplogroups that contain at least one eDNA barcode
+# - Within each haplogroup facet: barcodes are ordered by mean log-depth
+# - Left side shows barcode labels + a sample-type color strip (tissue vs eDNA)
+# - Heatmap shows log10(DP+1) across SNP index (panel positions for that profile)
+#
+# Required objects:
+#   conc_plot 
+#   depth_long 
+#   qc_current 
+# ============================================================
+
+library(ggnewscale)
+library(viridis)
+
+plot_depth_edna_haplogroups_collapsed <- function(
+  prof,
+  conc_plot,
+  depth_long,
+  qc_current,
+  col_edna = "#7B3294",
+  col_tissue = "#7A7A7A",
+  label_x = -6,
+  strip_x  = -2.5,
+  strip_width = 2.8,
+  singleton_label = "eDNA-only singletons"
+) {
+
+  # SNP positions used in the concordance plot for this profile
+  pos_set <- conc_plot %>%
+    dplyr::filter(profile == prof) %>%
+    dplyr::distinct(POS) %>%
+    dplyr::mutate(POS = as.numeric(POS))
+
+  stopifnot(nrow(pos_set) > 0)
+
+  # Metadata for barcodes in this profile
+  meta_prof <- paired_samples %>%
+    dplyr::filter(profile == prof, sample_type %in% c("tissue","edna")) %>%
+    dplyr::transmute(
+      barcode     = as.character(barcode),
+      sample_type = as.character(sample_type),
+      haplogroup  = as.character(haplogroup)
+    ) %>%
+    dplyr::filter(!is.na(haplogroup)) %>%
+    dplyr::distinct()
+
+  stopifnot(nrow(meta_prof) > 0)
+
+  # Keep haplogroups that have at least one eDNA member
+  hg_keep <- meta_prof %>%
+    dplyr::group_by(haplogroup) %>%
+    dplyr::summarise(has_edna = any(sample_type == "edna"), .groups = "drop") %>%
+    dplyr::filter(has_edna) %>%
+    dplyr::pull(haplogroup)
+
+  meta_prof <- meta_prof %>% dplyr::filter(haplogroup %in% hg_keep)
+
+  # Haplogroup metadata for facet labels and ordering
+  hg_meta <- meta_prof %>%
+    dplyr::group_by(haplogroup) %>%
+    dplyr::summarise(
+      n_total  = dplyr::n_distinct(barcode),
+      n_edna   = sum(sample_type == "edna"),
+      n_tissue = sum(sample_type == "tissue"),
+      is_mixed = (n_edna > 0 & n_tissue > 0),
+      is_edna_only_singleton = (n_edna > 0 & n_tissue == 0 & n_total == 1),
+      .groups = "drop"
+    )
+
+  # Depth data restricted to SNP positions used for  profile
+  depth_prof <- depth_long %>%
+    dplyr::transmute(
+      barcode = as.character(barcode),
+      POS     = as.numeric(POS),
+      DP      = as.numeric(DP)
+    ) %>%
+    dplyr::semi_join(pos_set, by = "POS")
+
+  stopifnot(nrow(depth_prof) > 0)
+
+  plot_df <- depth_prof %>%
+    dplyr::inner_join(meta_prof, by = "barcode") %>%
+    dplyr::mutate(depth_log = log10(DP + 1))
+
+  if (nrow(plot_df) == 0) {
+    message(
+      "No depth rows after joining for profile = ", prof,
+      ". (Depth table missing these barcodes.)"
+    )
+    return(NULL)
+  }
+
+  # Map POS to an index (x-axis = snp_index)
+  pos_index <- plot_df %>%
+    dplyr::distinct(POS) %>%
+    dplyr::arrange(POS) %>%
+    dplyr::mutate(snp_index = dplyr::row_number())
+
+  plot_df <- plot_df %>%
+    dplyr::left_join(pos_index, by = "POS") %>%
+    dplyr::left_join(hg_meta, by = "haplogroup") %>%
+    dplyr::mutate(
+      hg_lab = ifelse(
+        is_edna_only_singleton,
+        singleton_label,
+        paste0(haplogroup, " (n=", n_total, "; edna=", n_edna, ")")
+      )
+    )
+
+  # Facet ordering: mixed first, then by eDNA count, then total count
+  facet_levels <- hg_meta %>%
+    dplyr::mutate(
+      hg_lab = ifelse(
+        is_edna_only_singleton,
+        singleton_label,
+        paste0(haplogroup, " (n=", n_total, "; edna=", n_edna, ")")
+      )
+    ) %>%
+    dplyr::arrange(desc(is_mixed), desc(n_edna), desc(n_total), haplogroup) %>%
+    dplyr::pull(hg_lab) %>%
+    unique()
+
+  facet_levels <- c(setdiff(facet_levels, singleton_label), singleton_label)
+
+  plot_df <- plot_df %>%
+    dplyr::mutate(hg_lab = factor(hg_lab, levels = facet_levels))
+
+  # Barcode ordering within each haplogroup facet: tissue then eDNA
+  barcode_levels <- plot_df %>%
+    dplyr::group_by(hg_lab, barcode, sample_type) %>%
+    dplyr::summarise(mean_depth = mean(depth_log, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(
+      hg_lab,
+      factor(sample_type, levels = c("tissue","edna")),
+      desc(mean_depth)
+    ) %>%
+    dplyr::pull(barcode) %>%
+    unique()
+
+  plot_df <- plot_df %>%
+    dplyr::mutate(barcode = factor(barcode, levels = barcode_levels))
+
+  # left-side label strip
+  strip_df <- plot_df %>%
+    dplyr::distinct(hg_lab, barcode, sample_type) %>%
+    dplyr::mutate(x = strip_x)
+
+  label_df <- strip_df %>%
+    dplyr::distinct(hg_lab, barcode, sample_type) %>%
+    dplyr::mutate(x = label_x)
+
+  ggplot() +
+    geom_text(
+      data = label_df,
+      aes(x = x, y = barcode, label = as.character(barcode), color = sample_type),
+      hjust = 1, size = 3, fontface = "bold"
+    ) +
+    scale_color_manual(values = c(tissue = col_tissue, edna = col_edna), guide = "none") +
+    ggnewscale::new_scale_fill() +
+    geom_tile(
+      data = strip_df,
+      aes(x = x, y = barcode, fill = sample_type),
+      width = strip_width, height = 0.9,
+      color = "white", linewidth = 0.2
+    ) +
+    scale_fill_manual(values = c(tissue = col_tissue, edna = col_edna), name = "Sample type") +
+    ggnewscale::new_scale_fill() +
+    geom_tile(
+      data = plot_df,
+      aes(x = snp_index, y = barcode, fill = depth_log),
+      height = 0.9
+    ) +
+    facet_grid(hg_lab ~ ., scales = "free_y", space = "free_y") +
+    scale_fill_viridis_c(name = "Depth\nlog10(dp+1)", option = "magma") +
+    scale_x_continuous(limits = c(label_x - 1, NA), expand = c(0, 0)) +
+    coord_cartesian(clip = "off") +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      strip.background = element_blank(),
+      strip.text.y = element_text(face = "bold", size = 12),
+      plot.margin = margin(t = 5.5, r = 5.5, b = 5.5, l = 80)
+    ) +
+    labs(x = "SNP index", y = "Barcode")
+}
+
+# ------------------------------------------------------------
+# Supporting Fig 8 panels
+# ------------------------------------------------------------
+p_strict  <- plot_depth_edna_haplogroups_collapsed("strict",   conc_plot, depth_long, paired_valid)
+p_mod     <- plot_depth_edna_haplogroups_collapsed("moderate", conc_plot, depth_long, paired_valid)
+p_relaxed <- plot_depth_edna_haplogroups_collapsed("relaxed",  conc_plot, depth_long, paired_valid)
+
+# increase y-axis title margin
+add_y_title_margin <- function(p, r = 50) {
+  p + theme(axis.title.y = element_text(margin = margin(r = r)))
+}
+
+p_strict  <- add_y_title_margin(p_strict,  r = 50)
+p_mod     <- add_y_title_margin(p_mod,     r = 50)
+p_relaxed <- add_y_title_margin(p_relaxed, r = 50)
+
+p_strict
+p_mod
+p_relaxed
+```
+
+```{r}
+# ============================================================
+# Permutation test: are true eDNA–tissue pairs more similar than random pairing?
+#     Uses a distance matrix of mismatch proportions computed from hapmat
+#
+# Required objects:
+#   profile_results
+#   paired_valid
+#   qc_current
+# ============================================================
+
+paired_valid <- paired_valid %>% mutate(sample_type = tolower(sample_type))
+qc_current   <- qc_current   %>% mutate(sample_type = tolower(sample_type))
+
+pairs_edna <- paired_valid %>%
+  dplyr::mutate(
+    profile     = as.character(profile),
+    edna_bc     = as.character(barcode),
+    tissue_bc   = as.character(sample_pair),
+    sample_type = tolower(as.character(sample_type))
+  ) %>%
+  dplyr::filter(sample_type == "edna", !is.na(tissue_bc)) %>%
+  dplyr::select(profile, edna_bc, tissue_bc) %>%
+  dplyr::distinct()
+
+glimpse(pairs_edna)
+paired_valid_edna <- paired_valid %>%
+  filter(sample_type == "edna", !is.na(sample_pair)) %>%
+  transmute(
+    profile = as.character(profile),
+    edna_bc = as.character(barcode),
+    tissue_bc = as.character(sample_pair)
+  ) %>%
+  distinct()
+
+for (prof in names(dist_counts_list)) {
+
+  dmat <- dist_counts_list[[prof]]
+
+  cat("\nPROFILE:", prof, "\n")
+
+  print(
+    pairs_edna %>%
+      dplyr::filter(profile == prof) %>%
+      dplyr::summarise(
+        n_pairs_raw   = dplyr::n(),
+        edna_in_mat   = sum(edna_bc   %in% rownames(dmat)),
+        tissue_in_mat = sum(tissue_bc %in% colnames(dmat))
+      )
+  )
+}
+
+# Check
+print(names(dist_counts_list))
+print(sort(unique(pairs_edna$profile)))
+
+
+panel_sizes <- paired_valid %>%
+  distinct(profile, n_panel_sites) %>%
+  arrange(profile)
+panel_sizes
+panel_lookup <- setNames(panel_sizes$n_panel_sites, panel_sizes$profile)
+
+diag_tbl <- purrr::imap_dfr(dist_counts_list, \(dmat, prof) {
+
+  tmp <- pairs_edna[pairs_edna$profile == prof, , drop = FALSE]
+
+  tibble::tibble(
+    profile       = prof,
+    n_pairs_raw   = nrow(tmp),
+    edna_in_mat   = sum(tmp$edna_bc   %in% rownames(dmat)),
+    tissue_in_mat = sum(tmp$tissue_bc %in% colnames(dmat))
+  )
+})
+
+perm_test_from_distcounts <- function(profile_value,
+                                      pairs_edna,
+                                      qc_current,
+                                      dist_counts_list,
+                                      n_perm = 10000,
+                                      seed = 123,
+                                      verbose = TRUE) {
+
+  set.seed(seed)
+
+  prof <- tolower(trimws(as.character(profile_value)[1]))
+  dmat <- dist_counts_list[[prof]]
+  if (is.null(dmat)) stop("No distance matrix found for profile: ", prof)
+
+    pairs_edna2 <- pairs_edna
+  names(pairs_edna2) <- tolower(names(pairs_edna2))
+
+  dat <- data.frame(
+    profile   = tolower(trimws(as.character(pairs_edna2[["profile"]]))),
+    edna_bc   = trimws(as.character(pairs_edna2[["edna_bc"]])),
+    tissue_bc = trimws(as.character(pairs_edna2[["tissue_bc"]])),
+    stringsAsFactors = FALSE
+  )
+  dat <- dat[dat$profile == prof, c("edna_bc","tissue_bc"), drop = FALSE]
+  dat <- unique(dat)
+
+  # Keep only those that exist in matrix
+  dat <- dat[dat$edna_bc %in% rownames(dmat) & dat$tissue_bc %in% colnames(dmat), , drop = FALSE]
+  n_pairs <- nrow(dat)
+
+  qc2 <- qc_current
+  names(qc2) <- tolower(names(qc2))
+
+  qc2$profile     <- tolower(trimws(as.character(qc2[["profile"]])))
+  qc2$barcode     <- trimws(as.character(qc2[["barcode"]]))
+  qc2$sample_type <- tolower(trimws(as.character(qc2[["sample_type"]])))
+
+  tissue_pool <- unique(qc2$barcode[qc2$profile == prof & qc2$sample_type == "tissue"])
+  tissue_pool <- intersect(tissue_pool, colnames(dmat))
+
+  if (verbose) {
+    cat("\nPROFILE:", prof,
+        "\n  n_pairs:", n_pairs,
+        "\n  tissue_pool:", length(tissue_pool),
+        "\n")
+  }
+
+  if (n_pairs == 0 || length(tissue_pool) == 0) {
+    return(list(profile = prof, n_pairs = n_pairs, obs_mean = NA_real_, p_value = NA_real_,
+                perm_means = numeric(), tissue_pool_n = length(tissue_pool)))
+  }
+
+  # Observed mean distance
+  panel_size <- panel_lookup[[prof]]
+  obs <- mapply(function(a,b) dmat[a,b], dat$edna_bc, dat$tissue_bc) / panel_size
+  obs_mean <- mean(obs, na.rm = TRUE)
+
+  # Null distribution
+  replace_t <- length(tissue_pool) < n_pairs
+  perm_means <- replicate(n_perm, {
+    rand_t <- sample(tissue_pool, n_pairs, replace = replace_t)
+    d <- mapply(function(a,b) dmat[a,b], dat$edna_bc, rand_t) / panel_size
+    mean(d, na.rm = TRUE)
+  })
+
+  p <- mean(perm_means <= obs_mean)
+
+  list(profile = prof, n_pairs = n_pairs, obs_mean = obs_mean, p_value = p,
+       perm_means = perm_means, tissue_pool_n = length(tissue_pool))
+}
+
+profile_names <- names(dist_counts_list)
+
+perm_out <- purrr::map(profile_names, \(prof)
+  perm_test_from_distcounts(
+    profile_value = prof,
+    pairs_edna = pairs_edna,
+    qc_current = qc_current,
+    dist_counts_list = dist_counts_list,
+    n_perm = 10000
+  )
+)
+results_perm <- purrr::map_dfr(perm_out, \(x)
+  tibble::tibble(
+    profile = x$profile,
+    n_pairs = x$n_pairs,
+    obs_mean = x$obs_mean,
+    p_value = x$p_value
+  )
+)
+
+results_perm
+
+```
+
+```{r}
+# Long format results for plotting
+perm_results <- purrr::imap_dfr(perm_out, \(x, prof) {
+  tibble(
+    profile = x$profile,
+    perm_mean = x$perm_means,
+    obs_mean = x$obs_mean
+  )
+})
+
+# Plot histogram + observed line (Supporting Fig 9 / permutation panel)
+ggplot(perm_results, aes(x = perm_mean)) +
+  geom_histogram(bins = 60) +
+  geom_vline(aes(xintercept = obs_mean), linewidth = 1) +
+  facet_wrap(~ profile, scales = "free") +
+  theme_bw() +
+  labs(
+    x = "Mean callable mismatch rate under random pairing",
+    y = "Permutation count",
+  )
+
+```
+
