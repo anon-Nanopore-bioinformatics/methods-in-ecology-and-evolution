@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# Nanopore mitochondrial SNP pipeline
+#
+# Steps:
+#   1) Trim primers (cutadapt)
+#   2) Map reads to reference (minimap2 map-ont), remove secondary alignments
+#   3) Tier-1 QC: retain barcodes by minimum mapped primary reads
+#   4) Consensus polishing (medaka)
+#   5) Variant calling (bcftools mpileup/call; max depth = 10000)
+#   6) Tier-2 filtering (strict / moderate / relaxed)
+#   7) Write per-barcode SNP tables to R-facing directories:
+#        snp_tables_medaka_{strict,moderate,relaxed}_d10000/
+#
+# Inputs:
+#   - Reference FASTA: sperm_whale_mito_ref.fasta (NC_002503.2)
+#   - Demultiplexed files named:
+#       SQK-NBD114-96_barcode01.fastq, SQK-NBD114-96_barcode02.fastq, ...
+#
+# Outputs:
+#   - bam/barcodeXX_clean.bam
+#   - medaka_out/barcodeXX/consensus.fasta and calls_to_draft.bam
+#   - variants_medaka_d10000/barcodeXX_raw.vcf.gz
+#   - variants_medaka_filtered_{profile}_d10000/barcodeXX_filtered.vcf.gz
+#   - snp_tables_medaka_{profile}_d10000/barcodeXX_snps.tsv
+# ============================================================
+
+# -------------------------
+# Configuration
+# -------------------------
+REF="sperm_whale_mito_ref.fasta"
+THREADS=8
+MAXDEPTH=10000
+MEDAKA_MODEL="r1041_e82_400bps_sup_v4.3.0"
+
+# Tier-1 thresholds (mapped primary reads)
+TIER1_STRICT=1000
+TIER1_MODERATE=500
+TIER1_RELAXED=250
+
+# Tier-2 thresholds
+QUAL_STRICT=30;   DP_STRICT=100;  AF_STRICT=0.15
+QUAL_MOD=20;      DP_MOD=50;      AF_MOD=0.15
+QUAL_REL=10;      DP_REL=30;      AF_REL=0.10
+
+# -------------------------
+# Directories
+# -------------------------
+mkdir -p trimmed logs bam medaka_out consensus
+mkdir -p variants_medaka_d10000
+mkdir -p variants_medaka_filtered_strict_d10000 variants_medaka_filtered_moderate_d10000 variants_medaka_filtered_relaxed_d10000
+mkdir -p snp_tables_medaka_strict_d10000 snp_tables_medaka_moderate_d10000 snp_tables_medaka_relaxed_d10000
+
+# -------------------------
+# Dependencies
+# -------------------------
+for exe in cutadapt minimap2 samtools bcftools medaka_consensus mafft; do
+  command -v "$exe" >/dev/null 2>&1 || { echo "[ERROR] Missing dependency: $exe"; exit 1; }
+done
+
+# -------------------------
+# Input discovery
+# -------------------------
+mapfile -t FASTQS < <(ls -1 SQK-NBD114-96_barcode*.fastq* 2>/dev/null || true)
+if [[ ${#FASTQS[@]} -eq 0 ]]; then
+  echo "[ERROR] No input FASTQ files found matching: SQK-NBD114-96_barcode*.fastq*"
+  exit 1
+fi
+
+BARCODES=()
+for f in "${FASTQS[@]}"; do
+  bn=$(basename "$f")
+  bc=$(echo "$bn" | sed -E 's/^SQK-NBD114-96_barcode([0-9]+)\.fastq(\.gz)?$/\1/')
+  BARCODES+=("$bc")
+done
+
+echo "[INFO] Barcodes: ${BARCODES[*]}"
+
+# ============================================================
+# 1) Primer trimming
+# ============================================================
+for BC in "${BARCODES[@]}"; do
+  IN="SQK-NBD114-96_barcode${BC}.fastq"
+  [[ -f "$IN" ]] || IN="SQK-NBD114-96_barcode${BC}.fastq.gz"
+
+  OUT="trimmed/barcode${BC}_trimmed.fastq"
+  LOG="logs/barcode${BC}_cutadapt.log"
+
+  echo "$(date) [cutadapt] barcode${BC}"
+  cutadapt \
+    --overlap 15 \
+    --front 'AATCCAGGTGCGGTTCTATCT' \
+    --front 'GTTGGAKTCTCTTCTTTCCTTCC' \
+    --front 'GAGAGGCMTTYRCATCCAAACG' \
+    --front 'GGTAGGGTAGGAAG' \
+    --front 'CGATCCACCTAAATTCCTGCA' \
+    --front 'GCTCAGGGCTTGGTATAAGGA' \
+    --front 'GCCTYAACCAACTYAACTRGG' \
+    --front 'GTGCTTGATACCWGCTTCCTTT' \
+    --front 'AAAGCAADACACTGAGAGATGNT' \
+    --front 'TARACRGYYAGGCAGATATTGC' \
+    -e 0.1 -O 15 \
+    --match-read-wildcards \
+    -o "$OUT" \
+    "$IN" \
+    > "$LOG" 2>&1
+done
+
+# ============================================================
+# 2) Read mapping and BAM preparation
+# ============================================================
+for BC in "${BARCODES[@]}"; do
+  IN="trimmed/barcode${BC}_trimmed.fastq"
+  OUTBAM="bam/barcode${BC}_clean.bam"
+
+  echo "$(date) [minimap2] barcode${BC}"
+  minimap2 -ax map-ont --secondary=no -Y "$REF" "$IN" \
+    | samtools sort -o "$OUTBAM" -
+  samtools index "$OUTBAM"
+done
+
+# ============================================================
+# 3) Tier-1 QC: mapped primary reads
+# ============================================================
+# Counts primary mapped alignments only (excludes unmapped, secondary, supplementary).
+echo -e "barcode\tmapped_primary_reads" > mapped_primary_reads.tsv
+for BAM in bam/barcode*_clean.bam; do
+  bc=$(basename "$BAM" _clean.bam)   # barcodeXX
+  n=$(samtools view -c -F 0x904 "$BAM")
+  echo -e "${bc}\t${n}" >> mapped_primary_reads.tsv
+done
+
+awk -v m="$TIER1_STRICT"   'NR>1 && $2>=m{print $1}' mapped_primary_reads.tsv | sort > barcodes_strict.txt
+awk -v m="$TIER1_MODERATE" 'NR>1 && $2>=m{print $1}' mapped_primary_reads.tsv | sort > barcodes_moderate.txt
+awk -v m="$TIER1_RELAXED"  'NR>1 && $2>=m{print $1}' mapped_primary_reads.tsv | sort > barcodes_relaxed.txt
+
+echo "[INFO] Tier-1 passing barcodes:"
+echo "  strict   (>=${TIER1_STRICT}):   $(wc -l < barcodes_strict.txt   | tr -d ' ')"
+echo "  moderate (>=${TIER1_MODERATE}): $(wc -l < barcodes_moderate.txt | tr -d ' ')"
+echo "  relaxed  (>=${TIER1_RELAXED}):  $(wc -l < barcodes_relaxed.txt  | tr -d ' ')"
+
+if [[ $(wc -l < barcodes_relaxed.txt) -eq 0 ]]; then
+  echo "[ERROR] No barcodes passed Tier-1 (relaxed threshold)."
+  exit 1
+fi
+
+# ============================================================
+# 4) Medaka consensus polishing
+# ============================================================
+while read -r bc; do
+  BAM="bam/${bc}_clean.bam"
+  OUTDIR="medaka_out/${bc}"
+
+  echo "$(date) [medaka] ${bc}"
+  medaka_consensus \
+    -i "$BAM" \
+    -d "$REF" \
+    -o "$OUTDIR" \
+    -m "$MEDAKA_MODEL" \
+    -t "$THREADS"
+done < barcodes_relaxed.txt
+
+# ============================================================
+# 5) Consensus collection and alignment
+# ============================================================
+OUTCONS="consensus/combined_consensus_with_ref.fasta"
+cp "$REF" "$OUTCONS"
+
+while read -r bc; do
+  CONS="medaka_out/${bc}/consensus.fasta"
+  [[ -f "$CONS" ]] || continue
+  {
+    read -r _hdr
+    echo ">${bc}"
+    cat
+  } < "$CONS" >> "$OUTCONS"
+done < barcodes_relaxed.txt
+
+mafft --auto "$OUTCONS" > consensus/mito_alignment_with_ref.fasta
+
+# ============================================================
+# 6) Variant calling (bcftools) with max depth = 10000
+# ============================================================
+while read -r bc; do
+  BAM="medaka_out/${bc}/calls_to_draft.bam"
+  RAW_VCF="variants_medaka_d10000/${bc}_raw.vcf.gz"
+
+  [[ -f "$BAM" ]] || { echo "[WARN] Missing $BAM, skipping ${bc}" >&2; continue; }
+
+  echo "$(date) [bcftools mpileup/call] ${bc}"
+  bcftools mpileup -Ou -f "$REF" -q 10 -Q 7 -d "$MAXDEPTH" "$BAM" \
+    | bcftools call -mv -Ou \
+    | bcftools norm -f "$REF" -Ou \
+    | bcftools view -m2 -M2 -v snps -Oz -o "$RAW_VCF"
+  bcftools index "$RAW_VCF"
+done < barcodes_relaxed.txt
+
+# ============================================================
+# 7) Tier-2 filtering per profile
+# ============================================================
+filter_profile () {
+  local prof="$1"
+  local list="$2"
+  local outdir="$3"
+  local expr="$4"
+
+  mkdir -p "$outdir"
+
+  while read -r bc; do
+    IN="variants_medaka_d10000/${bc}_raw.vcf.gz"
+    OUT="${outdir}/${bc}_filtered.vcf.gz"
+    [[ -f "$IN" ]] || { echo "[WARN] Missing $IN, skipping ${bc}" >&2; continue; }
+
+    echo "$(date) [bcftools filter:${prof}] ${bc}"
+    bcftools filter -i "$expr" -Oz -o "$OUT" "$IN"
+    bcftools index -t "$OUT"
+  done < "$list"
+}
+
+filter_profile strict barcodes_strict.txt variants_medaka_filtered_strict_d10000 \
+  "QUAL>=$QUAL_STRICT && INFO/DP>=$DP_STRICT && (INFO/DP4[2]+INFO/DP4[3]) >= $AF_STRICT*INFO/DP"
+
+filter_profile moderate barcodes_moderate.txt variants_medaka_filtered_moderate_d10000 \
+  "QUAL>=$QUAL_MOD && INFO/DP>=$DP_MOD && (INFO/DP4[2]+INFO/DP4[3]) >= $AF_MOD*INFO/DP"
+
+filter_profile relaxed barcodes_relaxed.txt variants_medaka_filtered_relaxed_d10000 \
+  "QUAL>=$QUAL_REL && INFO/DP>=$DP_REL && (INFO/DP4[2]+INFO/DP4[3]) >= $AF_REL*INFO/DP"
+
+# ============================================================
+# 8) Write per-barcode SNP tables to R-facing directories
+# ============================================================
+write_tables () {
+  local list="$1"
+  local vcfdir="$2"
+  local outdir="$3"
+
+  rm -f "${outdir}"/*_snps.tsv 2>/dev/null || true
+
+  while read -r bc; do
+    VCF="${vcfdir}/${bc}_filtered.vcf.gz"
+    [[ -f "$VCF" ]] || { echo "[WARN] Missing $VCF, skipping ${bc}" >&2; continue; }
+
+    OUT="${outdir}/${bc}_snps.tsv"
+    {
+      echo -e "CHROM\tPOS\tREF\tALT\tQUAL\tDP\tDP4"
+      bcftools query -f "%CHROM\t%POS\t%REF\t%ALT\t%QUAL\t%INFO/DP\t%INFO/DP4\n" "$VCF"
+    } > "$OUT"
+  done < "$list"
+}
+
+write_tables barcodes_strict.txt   variants_medaka_filtered_strict_d10000   snp_tables_medaka_strict_d10000
+write_tables barcodes_moderate.txt variants_medaka_filtered_moderate_d10000 snp_tables_medaka_moderate_d10000
+write_tables barcodes_relaxed.txt  variants_medaka_filtered_relaxed_d10000  snp_tables_medaka_relaxed_d10000
+
+echo "[INFO] SNP tables written:"
+echo "  strict:   $(ls snp_tables_medaka_strict_d10000/*_snps.tsv   2>/dev/null | wc -l)"
+echo "  moderate: $(ls snp_tables_medaka_moderate_d10000/*_snps.tsv 2>/dev/null | wc -l)"
+echo "  relaxed:  $(ls snp_tables_medaka_relaxed_d10000/*_snps.tsv  2>/dev/null | wc -l)"
+
+echo "[DONE]"
